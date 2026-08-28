@@ -1,5 +1,8 @@
 ﻿{
+  "app": "hexiron-music",
+  "port": 3000,
   "build": {
-    "location": "iran"
-  }
+    "location": "germany"
+  },
+  "disks": []
 }
