@@ -1,4 +1,5 @@
 ﻿{
-  "app": "hexiron-music",
-  "platform": "docker"
+  "build": {
+    "location": "iran"
+  }
 }
