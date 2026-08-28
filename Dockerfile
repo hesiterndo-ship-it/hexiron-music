@@ -2,9 +2,10 @@
 
 WORKDIR /app
 
-# Static FFmpeg + FFprobe
-COPY --from=mwader/static-ffmpeg:9.0.1 /ffmpeg /usr/local/bin/ffmpeg
-COPY --from=mwader/static-ffmpeg:9.0.1 /ffprobe /usr/local/bin/ffprobe
+# FFmpeg + FFprobe
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 # Python dependencies
 COPY requirements.txt .
