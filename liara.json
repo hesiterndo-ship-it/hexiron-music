@@ -1,7 +1,13 @@
 ﻿{
   "app": "hexiron-music",
+  "platform": "docker",
   "build": {
     "location": "iran"
   },
-  "disks": []
+  "disks": [
+    {
+      "name": "data",
+      "mountTo": "/data"
+    }
+  ]
 }
