@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from functools import partial
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from pyrogram import Client, filters, idle
 from pyrogram.handlers import MessageHandler
@@ -10,12 +10,30 @@ from pytgcalls import PyTgCalls
 from pytgcalls import filters as pytgfilters
 from pytgcalls.types import StreamEnded
 
-from config import API_HASH, API_ID, BOT_TOKEN, STRING_SESSION, validate_config
+from config import (
+    API_HASH,
+    API_ID,
+    BOT_TOKEN,
+    STRING_SESSION,
+    validate_config,
+)
 from database import init_db
 from handlers.admin import on_added_to_group, panel, start
-from handlers.player import on_stream_end, pause, play, queue_list, resume, skip, stop
+from handlers.player import (
+    on_stream_end,
+    pause,
+    play,
+    queue_list,
+    resume,
+    skip,
+    stop,
+)
 from utils.ffmpeg_setup import ensure_ffmpeg
 
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,38 +43,79 @@ logging.basicConfig(
 logger = logging.getLogger("hexiron")
 
 
+# =========================================================
+# SOCKS5 PROXY
+# =========================================================
+
 def get_proxy():
     """
-    Read SOCKS5 proxy from environment variable.
+    Read SOCKS5 proxy from:
 
-    Expected format:
-    socks5://USERNAME:PASSWORD@HOST:PORT
+        SOCKS5_PROXY_URL
 
-    Also supports:
-    socks5://HOST:PORT
+    Supported formats:
+
+        socks5://HOST:PORT
+
+        socks5://USERNAME:PASSWORD@HOST:PORT
+
+        socks5h://HOST:PORT
+
+        socks5h://USERNAME:PASSWORD@HOST:PORT
+
+    Example:
+
+        socks5://hexironproxy:password@185.221.237.197:1080
     """
 
     proxy_url = os.getenv("SOCKS5_PROXY_URL", "").strip()
 
+    # -----------------------------------------------------
+    # Proxy is REQUIRED
+    # -----------------------------------------------------
+
     if not proxy_url:
-        logger.warning(
+        raise RuntimeError(
             "SOCKS5_PROXY_URL is not set. "
-            "Telegram connections will use the normal network."
+            "The bot will not start without a SOCKS5 proxy."
         )
-        return None
 
     try:
         parsed = urlparse(proxy_url)
 
-        if parsed.scheme.lower() not in ("socks5", "socks5h"):
+        # -------------------------------------------------
+        # Check protocol
+        # -------------------------------------------------
+
+        scheme = parsed.scheme.lower()
+
+        if scheme not in ("socks5", "socks5h"):
             raise ValueError(
-                "SOCKS5_PROXY_URL must use socks5:// or socks5h://"
+                "SOCKS5_PROXY_URL must start with "
+                "socks5:// or socks5h://"
             )
 
-        if not parsed.hostname or not parsed.port:
+        # -------------------------------------------------
+        # Check host
+        # -------------------------------------------------
+
+        if not parsed.hostname:
             raise ValueError(
-                "SOCKS5_PROXY_URL must contain HOST and PORT"
+                "SOCKS5_PROXY_URL is missing HOST."
             )
+
+        # -------------------------------------------------
+        # Check port
+        # -------------------------------------------------
+
+        if not parsed.port:
+            raise ValueError(
+                "SOCKS5_PROXY_URL is missing PORT."
+            )
+
+        # -------------------------------------------------
+        # Build Pyrogram proxy configuration
+        # -------------------------------------------------
 
         proxy = {
             "scheme": "socks5",
@@ -64,79 +123,125 @@ def get_proxy():
             "port": parsed.port,
         }
 
+        # -------------------------------------------------
+        # Optional username
+        # -------------------------------------------------
+
         if parsed.username:
-            proxy["username"] = parsed.username
+            proxy["username"] = unquote(parsed.username)
+
+        # -------------------------------------------------
+        # Optional password
+        # -------------------------------------------------
 
         if parsed.password:
-            proxy["password"] = parsed.password
+            proxy["password"] = unquote(parsed.password)
+
+        # -------------------------------------------------
+        # Do NOT print password
+        # -------------------------------------------------
 
         logger.info(
-            "SOCKS5 proxy enabled: %s:%s",
+            "SOCKS5 proxy configured: %s:%s",
             parsed.hostname,
             parsed.port,
         )
 
+        logger.info(
+            "Telegram connections will use the SOCKS5 proxy."
+        )
+
         return proxy
 
-    except Exception as e:
-        logger.error("Invalid SOCKS5_PROXY_URL: %s", e)
+    except ValueError:
         raise
 
+    except Exception as e:
+        raise RuntimeError(
+            f"Invalid SOCKS5_PROXY_URL: {e}"
+        ) from e
+
+
+# =========================================================
+# MAIN RUNNER
+# =========================================================
 
 async def run():
+
+    # -----------------------------------------------------
+    # Validate configuration
+    # -----------------------------------------------------
+
     validate_config()
+
+    # -----------------------------------------------------
+    # Initialize database
+    # -----------------------------------------------------
+
     init_db()
+
+    # -----------------------------------------------------
+    # Make sure FFmpeg exists
+    # -----------------------------------------------------
+
     ensure_ffmpeg()
 
-    # ---------------------------------------------------------
-    # SOCKS5 PROXY
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # Load SOCKS5 proxy
+    # -----------------------------------------------------
+
     proxy = get_proxy()
 
-    # ---------------------------------------------------------
+    logger.info(
+        "SOCKS5 proxy is READY."
+    )
+
+    # =====================================================
     # BOT CLIENT
-    # ---------------------------------------------------------
-    # This bot handles visible commands such as:
-    # /start
-    # /play
-    # /admin
-    # /pause
-    # /resume
-    # /skip
-    # /stop
-    # /queue
-    # ---------------------------------------------------------
+    # =====================================================
+
     bot = Client(
         "hexiron_bot",
+
         api_id=API_ID,
         api_hash=API_HASH,
+
         bot_token=BOT_TOKEN,
+
+        # IMPORTANT:
+        # All Telegram API traffic from the bot
+        # goes through SOCKS5.
         proxy=proxy,
     )
 
-    # ---------------------------------------------------------
+    # =====================================================
     # USERBOT CLIENT
-    # ---------------------------------------------------------
-    # A normal Telegram user account is required for voice chats.
-    # PyTgCalls uses this client.
-    #
-    # STRING_SESSION must belong to the user account that is
-    # already a member of the groups where music will be played.
-    # ---------------------------------------------------------
+    # =====================================================
+
     userbot = Client(
         "hexiron_userbot",
+
         api_id=API_ID,
         api_hash=API_HASH,
+
         session_string=STRING_SESSION,
+
+        # IMPORTANT:
+        # Userbot also uses the same SOCKS5 proxy.
         proxy=proxy,
     )
+
+    # =====================================================
+    # PYTGCalls
+    # =====================================================
 
     calls = PyTgCalls(userbot)
 
-    # ---------------------------------------------------------
+    # =====================================================
     # COMMAND HANDLERS
-    # ---------------------------------------------------------
+    # =====================================================
 
+    # /start
     bot.add_handler(
         MessageHandler(
             start,
@@ -144,6 +249,7 @@ async def run():
         )
     )
 
+    # /admin
     bot.add_handler(
         MessageHandler(
             panel,
@@ -151,6 +257,7 @@ async def run():
         )
     )
 
+    # When bot is added to group
     bot.add_handler(
         MessageHandler(
             on_added_to_group,
@@ -158,6 +265,7 @@ async def run():
         )
     )
 
+    # /play
     bot.add_handler(
         MessageHandler(
             partial(play, calls=calls),
@@ -165,6 +273,7 @@ async def run():
         )
     )
 
+    # /pause
     bot.add_handler(
         MessageHandler(
             partial(pause, calls=calls),
@@ -172,6 +281,7 @@ async def run():
         )
     )
 
+    # /resume
     bot.add_handler(
         MessageHandler(
             partial(resume, calls=calls),
@@ -179,6 +289,7 @@ async def run():
         )
     )
 
+    # /skip
     bot.add_handler(
         MessageHandler(
             partial(skip, calls=calls),
@@ -186,6 +297,7 @@ async def run():
         )
     )
 
+    # /stop
     bot.add_handler(
         MessageHandler(
             partial(stop, calls=calls),
@@ -193,6 +305,7 @@ async def run():
         )
     )
 
+    # /queue
     bot.add_handler(
         MessageHandler(
             queue_list,
@@ -200,9 +313,9 @@ async def run():
         )
     )
 
-    # ---------------------------------------------------------
+    # =====================================================
     # AUTO PLAY NEXT TRACK
-    # ---------------------------------------------------------
+    # =====================================================
 
     @calls.on_update(pytgfilters.stream_end())
     async def _on_stream_end(_, update: StreamEnded):
@@ -212,32 +325,77 @@ async def run():
             update.chat_id,
         )
 
-    # ---------------------------------------------------------
+    # =====================================================
     # START
-    # ---------------------------------------------------------
+    # =====================================================
 
-    logger.info("HexIron Music starting...")
+    logger.info(
+        "HexIron Music starting..."
+    )
 
     try:
-        # Start bot first
+
+        # -------------------------------------------------
+        # Start Telegram bot
+        # -------------------------------------------------
+
+        logger.info(
+            "Starting Telegram bot through SOCKS5..."
+        )
+
         await bot.start()
 
-        # Start PyTgCalls / userbot
+        logger.info(
+            "Telegram bot connected successfully."
+        )
+
+        # -------------------------------------------------
+        # Start PyTgCalls / Userbot
+        # -------------------------------------------------
+
+        logger.info(
+            "Starting Telegram userbot through SOCKS5..."
+        )
+
         await calls.start()
 
-        logger.info("HexIron Music is up and running.")
+        logger.info(
+            "Telegram userbot connected successfully."
+        )
+
+        # -------------------------------------------------
+        # Everything is ready
+        # -------------------------------------------------
+
+        logger.info(
+            "HexIron Music is up and running."
+        )
 
         # Keep application alive
         await idle()
 
     finally:
-        logger.info("Stopping HexIron Music...")
+
+        logger.info(
+            "Stopping HexIron Music..."
+        )
+
+        # -------------------------------------------------
+        # Stop bot safely
+        # -------------------------------------------------
 
         try:
             await bot.stop()
         except Exception as e:
-            logger.warning("Error while stopping bot: %s", e)
+            logger.warning(
+                "Error while stopping bot: %s",
+                e,
+            )
 
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
 def main():
     asyncio.run(run())
