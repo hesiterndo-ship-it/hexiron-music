@@ -1,3 +1,4 @@
+```python
 import asyncio
 import logging
 import os
@@ -17,6 +18,7 @@ from config import (
     STRING_SESSION,
     validate_config,
 )
+
 from database import init_db
 from handlers.admin import on_added_to_group, panel, start
 from handlers.player import (
@@ -49,43 +51,37 @@ logger = logging.getLogger("hexiron")
 
 def get_proxy():
     """
-    Read SOCKS5 proxy from:
+    Read SOCKS5 proxy from environment.
 
-        SOCKS5_PROXY_URL
-
-    Supported formats:
-
-        socks5://HOST:PORT
-
+    Expected:
         socks5://USERNAME:PASSWORD@HOST:PORT
 
-        socks5h://HOST:PORT
-
-        socks5h://USERNAME:PASSWORD@HOST:PORT
-
     Example:
-
-        socks5://hexironproxy:password@185.221.237.197:1080
+        socks5://myuser:mypass@185.221.237.197:1080
     """
 
     proxy_url = os.getenv("SOCKS5_PROXY_URL", "").strip()
 
     # -----------------------------------------------------
-    # Proxy is REQUIRED
+    # Proxy variable does not exist
     # -----------------------------------------------------
 
     if not proxy_url:
-        raise RuntimeError(
-            "SOCKS5_PROXY_URL is not set. "
-            "The bot will not start without a SOCKS5 proxy."
+        logger.error(
+            "SOCKS5_PROXY_URL is NOT SET."
         )
+        logger.error(
+            "Telegram will try to connect WITHOUT proxy."
+        )
+
+        return None
+
+    # -----------------------------------------------------
+    # Parse proxy URL
+    # -----------------------------------------------------
 
     try:
         parsed = urlparse(proxy_url)
-
-        # -------------------------------------------------
-        # Check protocol
-        # -------------------------------------------------
 
         scheme = parsed.scheme.lower()
 
@@ -95,75 +91,63 @@ def get_proxy():
                 "socks5:// or socks5h://"
             )
 
-        # -------------------------------------------------
-        # Check host
-        # -------------------------------------------------
+        hostname = parsed.hostname
+        port = parsed.port
 
-        if not parsed.hostname:
+        if not hostname:
             raise ValueError(
-                "SOCKS5_PROXY_URL is missing HOST."
+                "Proxy hostname is missing."
             )
 
-        # -------------------------------------------------
-        # Check port
-        # -------------------------------------------------
-
-        if not parsed.port:
+        if not port:
             raise ValueError(
-                "SOCKS5_PROXY_URL is missing PORT."
+                "Proxy port is missing."
             )
 
-        # -------------------------------------------------
-        # Build Pyrogram proxy configuration
-        # -------------------------------------------------
+        username = (
+            unquote(parsed.username)
+            if parsed.username
+            else None
+        )
+
+        password = (
+            unquote(parsed.password)
+            if parsed.password
+            else None
+        )
 
         proxy = {
             "scheme": "socks5",
-            "hostname": parsed.hostname,
-            "port": parsed.port,
+            "hostname": hostname,
+            "port": port,
         }
 
-        # -------------------------------------------------
-        # Optional username
-        # -------------------------------------------------
+        if username:
+            proxy["username"] = username
 
-        if parsed.username:
-            proxy["username"] = unquote(parsed.username)
+        if password:
+            proxy["password"] = password
 
-        # -------------------------------------------------
-        # Optional password
-        # -------------------------------------------------
-
-        if parsed.password:
-            proxy["password"] = unquote(parsed.password)
-
-        # -------------------------------------------------
-        # Do NOT print password
-        # -------------------------------------------------
-
+        # IMPORTANT:
+        # Never print username/password.
         logger.info(
-            "SOCKS5 proxy configured: %s:%s",
-            parsed.hostname,
-            parsed.port,
-        )
-
-        logger.info(
-            "Telegram connections will use the SOCKS5 proxy."
+            "SOCKS5 proxy ENABLED -> %s:%s",
+            hostname,
+            port,
         )
 
         return proxy
 
-    except ValueError:
-        raise
-
     except Exception as e:
-        raise RuntimeError(
-            f"Invalid SOCKS5_PROXY_URL: {e}"
-        ) from e
+        logger.error(
+            "Invalid SOCKS5_PROXY_URL: %s",
+            e,
+        )
+        raise
 
 
 # =========================================================
-# MAIN RUNNER
+# MAIN
 # =========================================================
 
 async def run():
@@ -181,20 +165,25 @@ async def run():
     init_db()
 
     # -----------------------------------------------------
-    # Make sure FFmpeg exists
+    # FFmpeg
     # -----------------------------------------------------
 
     ensure_ffmpeg()
 
     # -----------------------------------------------------
-    # Load SOCKS5 proxy
+    # SOCKS5 PROXY
     # -----------------------------------------------------
 
     proxy = get_proxy()
 
-    logger.info(
-        "SOCKS5 proxy is READY."
-    )
+    if proxy:
+        logger.info(
+            "Telegram clients will use SOCKS5 proxy."
+        )
+    else:
+        logger.warning(
+            "Telegram clients are running WITHOUT SOCKS5 proxy."
+        )
 
     # =====================================================
     # BOT CLIENT
@@ -202,15 +191,9 @@ async def run():
 
     bot = Client(
         "hexiron_bot",
-
         api_id=API_ID,
         api_hash=API_HASH,
-
         bot_token=BOT_TOKEN,
-
-        # IMPORTANT:
-        # All Telegram API traffic from the bot
-        # goes through SOCKS5.
         proxy=proxy,
     )
 
@@ -220,19 +203,14 @@ async def run():
 
     userbot = Client(
         "hexiron_userbot",
-
         api_id=API_ID,
         api_hash=API_HASH,
-
         session_string=STRING_SESSION,
-
-        # IMPORTANT:
-        # Userbot also uses the same SOCKS5 proxy.
         proxy=proxy,
     )
 
     # =====================================================
-    # PYTGCalls
+    # PYTGCallS
     # =====================================================
 
     calls = PyTgCalls(userbot)
@@ -241,7 +219,6 @@ async def run():
     # COMMAND HANDLERS
     # =====================================================
 
-    # /start
     bot.add_handler(
         MessageHandler(
             start,
@@ -249,7 +226,6 @@ async def run():
         )
     )
 
-    # /admin
     bot.add_handler(
         MessageHandler(
             panel,
@@ -257,7 +233,6 @@ async def run():
         )
     )
 
-    # When bot is added to group
     bot.add_handler(
         MessageHandler(
             on_added_to_group,
@@ -265,7 +240,6 @@ async def run():
         )
     )
 
-    # /play
     bot.add_handler(
         MessageHandler(
             partial(play, calls=calls),
@@ -273,7 +247,6 @@ async def run():
         )
     )
 
-    # /pause
     bot.add_handler(
         MessageHandler(
             partial(pause, calls=calls),
@@ -281,7 +254,6 @@ async def run():
         )
     )
 
-    # /resume
     bot.add_handler(
         MessageHandler(
             partial(resume, calls=calls),
@@ -289,7 +261,6 @@ async def run():
         )
     )
 
-    # /skip
     bot.add_handler(
         MessageHandler(
             partial(skip, calls=calls),
@@ -297,7 +268,6 @@ async def run():
         )
     )
 
-    # /stop
     bot.add_handler(
         MessageHandler(
             partial(stop, calls=calls),
@@ -305,7 +275,6 @@ async def run():
         )
     )
 
-    # /queue
     bot.add_handler(
         MessageHandler(
             queue_list,
@@ -319,6 +288,7 @@ async def run():
 
     @calls.on_update(pytgfilters.stream_end())
     async def _on_stream_end(_, update: StreamEnded):
+
         await on_stream_end(
             bot,
             calls,
@@ -336,42 +306,37 @@ async def run():
     try:
 
         # -------------------------------------------------
-        # Start Telegram bot
+        # Start Telegram Bot
         # -------------------------------------------------
 
         logger.info(
-            "Starting Telegram bot through SOCKS5..."
+            "Starting Telegram Bot client..."
         )
 
         await bot.start()
 
         logger.info(
-            "Telegram bot connected successfully."
+            "Telegram Bot connected successfully."
         )
 
         # -------------------------------------------------
-        # Start PyTgCalls / Userbot
+        # Start Userbot / PyTgCalls
         # -------------------------------------------------
 
         logger.info(
-            "Starting Telegram userbot through SOCKS5..."
+            "Starting Telegram Userbot / PyTgCalls..."
         )
 
         await calls.start()
 
         logger.info(
-            "Telegram userbot connected successfully."
+            "HexIron Music is UP and RUNNING."
         )
 
         # -------------------------------------------------
-        # Everything is ready
-        # -------------------------------------------------
-
-        logger.info(
-            "HexIron Music is up and running."
-        )
-
         # Keep application alive
+        # -------------------------------------------------
+
         await idle()
 
     finally:
@@ -380,9 +345,13 @@ async def run():
             "Stopping HexIron Music..."
         )
 
-        # -------------------------------------------------
-        # Stop bot safely
-        # -------------------------------------------------
+        try:
+            await calls.stop()
+        except Exception as e:
+            logger.warning(
+                "Error while stopping PyTgCalls: %s",
+                e,
+            )
 
         try:
             await bot.stop()
@@ -403,3 +372,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
