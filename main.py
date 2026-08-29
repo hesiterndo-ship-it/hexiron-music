@@ -73,6 +73,7 @@ async def run():
     ensure_ffmpeg()
 
     telegram_proxy = get_telegram_proxy()
+    data_dir = os.getenv("DATA_DIR", "/data")
 
     bot = Client(
         "hexiron_bot",
@@ -80,6 +81,7 @@ async def run():
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
         proxy=telegram_proxy,
+        workdir=data_dir,
     )
 
     userbot = Client(
@@ -88,6 +90,7 @@ async def run():
         api_hash=API_HASH,
         session_string=STRING_SESSION,
         proxy=telegram_proxy,
+        workdir=data_dir,
     )
 
     calls = PyTgCalls(userbot)

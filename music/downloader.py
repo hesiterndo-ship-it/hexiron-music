@@ -3,7 +3,7 @@ import os
 import requests
 from radiojavanapi import Client as RJClient
 
-DOWNLOAD_DIR = "downloads"
+DOWNLOAD_DIR = os.path.join(os.getenv("DATA_DIR", "/data"), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 _rj = RJClient()
@@ -23,9 +23,6 @@ def search_and_download(query: str) -> dict:
     if not results.songs:
         return None
 
-    # search() only returns lightweight ShortData (id, name, artist) with
-    # no download link — the full Song object (with hq_link/duration) has
-    # to be fetched separately by id.
     short = results.songs[0]
     song = _rj.get_song_by_id(short.id)
 
@@ -41,7 +38,7 @@ def search_and_download(query: str) -> dict:
 
     return {
         "title": title,
-        "duration": song.duration or 0,
+        "duration": song.duration,
         "file_path": cached,
-        "video_id": song.id,
+        "video_id": str(song.id),
     }

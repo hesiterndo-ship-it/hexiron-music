@@ -1,7 +1,8 @@
+import os
 import sqlite3
 from contextlib import contextmanager
 
-DB_PATH = "hexiron.db"
+DB_PATH = os.path.join(os.getenv("DATA_DIR", "/data"), "hexiron.db")
 
 
 @contextmanager
@@ -18,6 +19,7 @@ def get_conn():
 
 def init_db():
     """Create tables if they don't exist. Call this once at startup."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with get_conn() as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS groups("

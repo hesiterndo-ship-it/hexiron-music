@@ -19,7 +19,7 @@ import urllib.request
 
 logger = logging.getLogger("hexiron.ffmpeg_setup")
 
-BIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
+BIN_DIR = os.path.join(os.getenv("DATA_DIR", "/data"), "bin")
 FFMPEG_URL = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
 ARCHIVE_PATH = "/tmp/ffmpeg-static.tar.xz"
 
