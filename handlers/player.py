@@ -1,11 +1,11 @@
 import asyncio
 import logging
 import os
-import subprocess
 
 from pyrogram import Client
 from pyrogram.enums import ChatType
 from pyrogram.types import Message
+
 from pytgcalls import PyTgCalls
 from pytgcalls.exceptions import NoActiveGroupCall
 from pytgcalls.types import MediaStream
@@ -27,136 +27,55 @@ active_chats = set()
 GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
 
 
-def _check_media_file(file_path: str) -> bool:
-    """
-    Verify that the downloaded media exists and FFprobe can read it.
-    """
-    if not file_path:
-        logger.error("Media path is empty.")
-        return False
-
-    if not os.path.isfile(file_path):
-        logger.error("Media file does not exist: %s", file_path)
-        return False
-
-    try:
-        size = os.path.getsize(file_path)
-
-        if size <= 0:
-            logger.error("Media file is empty: %s", file_path)
-            return False
-
-        logger.info(
-            "Checking media file: path=%s size=%d bytes",
-            file_path,
-            size,
-        )
-
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration,format_name",
-                "-of",
-                "default=noprint_wrappers=1",
-                file_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        if result.returncode != 0:
-            logger.error(
-                "FFprobe failed for %s: %s",
-                file_path,
-                result.stderr.strip(),
-            )
-            return False
-
-        logger.info(
-            "FFprobe OK for %s: %s",
-            file_path,
-            result.stdout.strip().replace("\n", " | "),
-        )
-
-        return True
-
-    except Exception:
-        logger.exception(
-            "Unexpected error while checking media file: %s",
-            file_path,
-        )
-        return False
-
-
 def _build_stream(file_path: str) -> MediaStream:
     """
     Build an audio-only MediaStream.
 
-    FFmpeg/FFprobe are installed in the Docker image.
+    RadioJavan files are downloaded as M4A/AAC.
+    FFmpeg is used by ntgcalls to decode them.
     """
+
+    if not file_path:
+        raise ValueError("مسیر فایل خالی است.")
+
+    file_path = os.path.abspath(file_path)
+
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(
+            f"فایل آهنگ پیدا نشد: {file_path}"
+        )
+
+    file_size = os.path.getsize(file_path)
+
+    if file_size <= 0:
+        raise ValueError(
+            f"فایل آهنگ خالی است: {file_path}"
+        )
+
     logger.info(
-        "Building MediaStream: %s",
+        "Building audio stream: %s (%d bytes)",
         file_path,
+        file_size,
     )
 
     return MediaStream(
         file_path,
         audio_parameters=AudioQuality.HIGH,
         video_flags=MediaStream.Flags.IGNORE,
+        ffmpeg_parameters=(
+            "-vn "
+            "-ac 2 "
+            "-ar 48000 "
+            "-f s16le"
+        ),
     )
 
 
-async def _play_track(
-    calls: PyTgCalls,
-    chat_id: int,
-    file_path: str,
-) -> None:
-    """
-    Validate the file, create MediaStream and start playback.
-    Detailed exceptions are logged so the real ntgcalls error
-    appears in Liara logs.
-    """
-
-    logger.info(
-        "Starting playback: chat_id=%s file=%s",
-        chat_id,
-        file_path,
-    )
-
-    if not _check_media_file(file_path):
-        raise RuntimeError(
-            "فایل صوتی توسط FFprobe قابل خواندن نیست."
-        )
-
+async def _safe_edit(message: Message, text: str):
     try:
-        stream = _build_stream(file_path)
-
-        logger.info(
-            "MediaStream created successfully: chat_id=%s",
-            chat_id,
-        )
-
-        await calls.play(
-            chat_id,
-            stream,
-        )
-
-        logger.info(
-            "calls.play() completed successfully: chat_id=%s",
-            chat_id,
-        )
-
+        await message.edit_text(text)
     except Exception:
-        logger.exception(
-            "PyTgCalls playback failed: chat_id=%s file=%s",
-            chat_id,
-            file_path,
-        )
-        raise
+        pass
 
 
 async def play(
@@ -170,7 +89,9 @@ async def play(
         )
         return
 
-    if not await is_group_licensed(message.chat.id):
+    chat_id = message.chat.id
+
+    if not await is_group_licensed(chat_id):
         buy_hint = (
             f"@{CENTRAL_BOT_USERNAME}"
             if CENTRAL_BOT_USERNAME
@@ -189,11 +110,21 @@ async def play(
         )
         return
 
-    query = message.text.split(None, 1)[1]
+    query = message.text.split(None, 1)[1].strip()
+
+    if not query:
+        await message.reply_text(
+            "اسم آهنگ را وارد کن."
+        )
+        return
 
     status = await message.reply_text(
         f"🔎 در حال جستجو: {query}"
     )
+
+    # --------------------------------------------------
+    # SEARCH + DOWNLOAD
+    # --------------------------------------------------
 
     try:
         track = await asyncio.to_thread(
@@ -201,76 +132,46 @@ async def play(
             query,
         )
 
-    except Exception:
+    except Exception as e:
         logger.exception(
-            "Search/download failed: query=%s",
+            "Search/download failed for %r",
             query,
         )
 
-        await status.edit_text(
-            "❌ خطا در جست‌وجو/دانلود."
+        await _safe_edit(
+            status,
+            f"❌ خطا در جست‌وجو/دانلود:\n{e}",
         )
         return
 
     if track is None:
-        await status.edit_text(
-            "چیزی پیدا نشد."
+        await _safe_edit(
+            status,
+            "❌ چیزی پیدا نشد.",
         )
         return
 
-    chat_id = message.chat.id
     file_path = track.get("file_path")
 
+    if not file_path:
+        await _safe_edit(
+            status,
+            "❌ مسیر فایل آهنگ دریافت نشد.",
+        )
+        return
+
     logger.info(
-        "Track found: chat_id=%s title=%s path=%s duration=%s",
-        chat_id,
+        "Track selected: title=%r path=%r duration=%r",
         track.get("title"),
         file_path,
         track.get("duration"),
     )
 
-    if chat_id not in active_chats:
-        try:
-            await _play_track(
-                calls,
-                chat_id,
-                file_path,
-            )
+    # --------------------------------------------------
+    # QUEUE
+    # --------------------------------------------------
 
-            active_chats.add(chat_id)
-
-            await status.edit_text(
-                f"▶️ در حال پخش: {track['title']} "
-                f"({format_duration(track['duration'])})"
-            )
-
-        except NoActiveGroupCall:
-            logger.exception(
-                "No active group call: chat_id=%s",
-                chat_id,
-            )
-
-            active_chats.discard(chat_id)
-
-            await status.edit_text(
-                "❌ ویس‌چت این گروه فعال نیست. "
-                "اول یک ویس‌چت در گروه شروع کن."
-            )
-
-        except Exception as e:
-            logger.exception(
-                "Playback error: chat_id=%s title=%s",
-                chat_id,
-                track.get("title"),
-            )
-
-            active_chats.discard(chat_id)
-
-            await status.edit_text(
-                f"❌ خطا در پخش: {e}"
-            )
-
-    else:
+    if chat_id in active_chats:
         try:
             user_id = (
                 message.from_user.id
@@ -281,23 +182,88 @@ async def play(
             database.add_to_queue(
                 chat_id,
                 track["title"],
-                track["file_path"],
+                file_path,
                 user_id,
             )
 
-            await status.edit_text(
-                f"➕ به صف اضافه شد: {track['title']}"
+            await _safe_edit(
+                status,
+                f"➕ به صف اضافه شد:\n{track['title']}",
             )
 
-        except Exception:
+        except Exception as e:
             logger.exception(
-                "Failed to add track to queue: chat_id=%s",
+                "Queue error for chat %s",
                 chat_id,
             )
 
-            await status.edit_text(
-                "❌ خطا در اضافه کردن آهنگ به صف."
+            await _safe_edit(
+                status,
+                f"❌ خطا در اضافه کردن به صف:\n{e}",
             )
+
+        return
+
+    # --------------------------------------------------
+    # START PLAYBACK
+    # --------------------------------------------------
+
+    try:
+        stream = _build_stream(file_path)
+
+        logger.info(
+            "Starting playback in chat %s: %s",
+            chat_id,
+            file_path,
+        )
+
+        await calls.play(
+            chat_id,
+            stream,
+        )
+
+        active_chats.add(chat_id)
+
+        logger.info(
+            "Playback started successfully in chat %s",
+            chat_id,
+        )
+
+        duration = track.get("duration", 0)
+
+        await _safe_edit(
+            status,
+            f"▶️ در حال پخش:\n"
+            f"{track['title']} "
+            f"({format_duration(duration)})",
+        )
+
+    except NoActiveGroupCall:
+        active_chats.discard(chat_id)
+
+        logger.warning(
+            "No active group call in chat %s",
+            chat_id,
+        )
+
+        await _safe_edit(
+            status,
+            "❌ ویس‌چت این گروه فعال نیست.\n"
+            "اول یک ویس‌چت در گروه شروع کن.",
+        )
+
+    except Exception as e:
+        active_chats.discard(chat_id)
+
+        logger.exception(
+            "Playback failed in chat %s",
+            chat_id,
+        )
+
+        await _safe_edit(
+            status,
+            f"❌ خطا در پخش:\n{type(e).__name__}: {e}",
+        )
 
 
 async def pause(
@@ -316,12 +282,11 @@ async def pause(
 
     except Exception as e:
         logger.exception(
-            "Pause failed: chat_id=%s",
-            message.chat.id,
+            "Pause failed",
         )
 
         await message.reply_text(
-            f"❌ {e}"
+            f"❌ خطا در توقف موقت:\n{e}"
         )
 
 
@@ -341,12 +306,11 @@ async def resume(
 
     except Exception as e:
         logger.exception(
-            "Resume failed: chat_id=%s",
-            message.chat.id,
+            "Resume failed",
         )
 
         await message.reply_text(
-            f"❌ {e}"
+            f"❌ خطا در ادامه پخش:\n{e}"
         )
 
 
@@ -363,10 +327,7 @@ async def skip(
         try:
             await calls.leave_call(chat_id)
         except Exception:
-            logger.exception(
-                "Failed to leave call after empty queue: chat_id=%s",
-                chat_id,
-            )
+            pass
 
         active_chats.discard(chat_id)
 
@@ -376,29 +337,31 @@ async def skip(
         return
 
     try:
-        await _play_track(
-            calls,
+        stream = _build_stream(
+            nxt["file_path"]
+        )
+
+        await calls.play(
             chat_id,
-            nxt["file_path"],
+            stream,
         )
 
         active_chats.add(chat_id)
 
         await message.reply_text(
-            f"⏭ در حال پخش: {nxt['title']}"
+            f"⏭ در حال پخش:\n{nxt['title']}"
         )
 
     except Exception as e:
-        logger.exception(
-            "Skip playback failed: chat_id=%s file=%s",
-            chat_id,
-            nxt.get("file_path"),
-        )
-
         active_chats.discard(chat_id)
 
+        logger.exception(
+            "Skip playback failed in chat %s",
+            chat_id,
+        )
+
         await message.reply_text(
-            f"❌ خطا در پخش: {e}"
+            f"❌ خطا در پخش آهنگ بعدی:\n{type(e).__name__}: {e}"
         )
 
 
@@ -413,12 +376,8 @@ async def stop(
         await calls.leave_call(
             chat_id
         )
-
     except Exception:
-        logger.exception(
-            "Leave call failed during stop: chat_id=%s",
-            chat_id,
-        )
+        pass
 
     active_chats.discard(chat_id)
 
@@ -426,7 +385,7 @@ async def stop(
         database.clear_queue(chat_id)
     except Exception:
         logger.exception(
-            "Failed to clear queue: chat_id=%s",
+            "Failed to clear queue for chat %s",
             chat_id,
         )
 
@@ -439,21 +398,9 @@ async def queue_list(
     client: Client,
     message: Message,
 ):
-    try:
-        titles = database.peek_queue(
-            message.chat.id
-        )
-
-    except Exception:
-        logger.exception(
-            "Queue lookup failed: chat_id=%s",
-            message.chat.id,
-        )
-
-        await message.reply_text(
-            "❌ خطا در دریافت صف."
-        )
-        return
+    titles = database.peek_queue(
+        message.chat.id
+    )
 
     if not titles:
         await message.reply_text(
@@ -461,12 +408,11 @@ async def queue_list(
         )
         return
 
-    text = (
-        "📜 صف پخش:\n"
-        + "\n".join(
-            f"{i + 1}. {t}"
-            for i, t in enumerate(titles)
-        )
+    text = "📜 صف پخش:\n"
+
+    text += "\n".join(
+        f"{i + 1}. {title}"
+        for i, title in enumerate(titles)
     )
 
     await message.reply_text(
@@ -480,32 +426,19 @@ async def on_stream_end(
     chat_id: int,
 ):
     """
-    Called by main.py when a track finishes.
+    Called when the current stream ends.
     """
 
     logger.info(
-        "Stream ended: chat_id=%s",
+        "Stream ended in chat %s",
         chat_id,
     )
 
-    try:
-        nxt = database.pop_next(chat_id)
-
-    except Exception:
-        logger.exception(
-            "Failed to get next track: chat_id=%s",
-            chat_id,
-        )
-
-        active_chats.discard(chat_id)
-        return
+    nxt = database.pop_next(
+        chat_id
+    )
 
     if nxt is None:
-        logger.info(
-            "Queue empty after stream end: chat_id=%s",
-            chat_id,
-        )
-
         active_chats.discard(chat_id)
 
         try:
@@ -513,33 +446,37 @@ async def on_stream_end(
                 chat_id
             )
         except Exception:
-            logger.exception(
-                "Failed to leave call after stream end: chat_id=%s",
-                chat_id,
-            )
+            pass
+
+        logger.info(
+            "Queue empty; left chat %s",
+            chat_id,
+        )
 
         return
 
     try:
-        await _play_track(
-            calls,
+        stream = _build_stream(
+            nxt["file_path"]
+        )
+
+        await calls.play(
             chat_id,
-            nxt["file_path"],
+            stream,
         )
 
         active_chats.add(chat_id)
 
         logger.info(
-            "Next queued track started: chat_id=%s title=%s",
+            "Next track started in chat %s: %s",
             chat_id,
-            nxt.get("title"),
+            nxt["title"],
         )
 
-    except Exception:
-        logger.exception(
-            "Failed to play next queued track: chat_id=%s file=%s",
-            chat_id,
-            nxt.get("file_path"),
-        )
-
+    except Exception as e:
         active_chats.discard(chat_id)
+
+        logger.exception(
+            "Failed to play next track in chat %s",
+            chat_id,
+        )
