@@ -1,6 +1,6 @@
-pyrogram==2.0.106
-TgCrypto==1.2.5
-py-tgcalls[pyrogram]==2.3.3
+kurigram==2.2.24
+tgcrypto==1.2.5
+py-tgcalls==2.3.3
 radiojavanapi==0.7.0
 requests>=2.31.0
 python-dotenv>=1.0.1
