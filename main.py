@@ -10,10 +10,24 @@ from pytgcalls import PyTgCalls
 from pytgcalls import filters as pytgfilters
 from pytgcalls.types import StreamEnded
 
-from config import API_HASH, API_ID, BOT_TOKEN, STRING_SESSION, validate_config
+from config import (
+    API_HASH,
+    API_ID,
+    BOT_TOKEN,
+    STRING_SESSION,
+    validate_config,
+)
 from database import init_db
 from handlers.admin import on_added_to_group, panel, start
-from handlers.player import on_stream_end, pause, play, queue_list, resume, skip, stop
+from handlers.player import (
+    on_stream_end,
+    pause,
+    play,
+    queue_list,
+    resume,
+    skip,
+    stop,
+)
 from utils.ffmpeg_setup import ensure_ffmpeg
 
 
@@ -75,6 +89,10 @@ async def run():
     telegram_proxy = get_telegram_proxy()
     data_dir = os.getenv("DATA_DIR", "/data")
 
+    # ---------------------------------------------------------
+    # BOT
+    # Bot همچنان از SOCKS5 استفاده می‌کند.
+    # ---------------------------------------------------------
     bot = Client(
         "hexiron_bot",
         api_id=API_ID,
@@ -84,19 +102,31 @@ async def run():
         workdir=data_dir,
     )
 
-    # IMPORTANT:
-    # PyTgCalls 2.3.3 supports Pyrogram. The userbot therefore uses
-    # the real Pyrogram client instead of Kurigram.
+    # ---------------------------------------------------------
+    # USERBOT / PYTGCalls
+    #
+    # برای تست مشکل Voice Chat، عمداً Proxy را حذف کرده‌ایم.
+    # PyTgCalls از همین userbot برای phone.JoinGroupCall
+    # استفاده می‌کند.
+    # ---------------------------------------------------------
     userbot = Client(
         "hexiron_userbot",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=STRING_SESSION,
-        proxy=telegram_proxy,
         workdir=data_dir,
     )
 
+    logger.info(
+        "HexIron userbot is configured WITHOUT SOCKS5 proxy "
+        "for PyTgCalls voice-chat testing."
+    )
+
     calls = PyTgCalls(userbot)
+
+    # ---------------------------------------------------------
+    # BOT HANDLERS
+    # ---------------------------------------------------------
 
     bot.add_handler(
         MessageHandler(
@@ -168,7 +198,10 @@ async def run():
     logger.info("HexIron Music starting...")
 
     try:
+        # Start bot
         await bot.start()
+
+        # Start PyTgCalls / userbot
         await calls.start()
 
         logger.info("HexIron Music is up and running.")
@@ -176,12 +209,13 @@ async def run():
         await idle()
 
     finally:
-        # Stop PyTgCalls first, then the bot client.
+        # Stop PyTgCalls first
         try:
             await calls.stop()
         except Exception:
             logger.exception("Failed to stop PyTgCalls cleanly")
 
+        # Then stop bot
         try:
             await bot.stop()
         except Exception:
