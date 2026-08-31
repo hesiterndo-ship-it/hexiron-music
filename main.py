@@ -26,7 +26,7 @@ logger = logging.getLogger("hexiron")
 
 
 def get_telegram_proxy():
-    proxy_url = os.getenv("SOCKS5_PROXY_URL")
+    proxy_url = os.getenv("SOCKS5_PROXY_URL", "").strip()
 
     if not proxy_url:
         logger.info(
@@ -84,6 +84,9 @@ async def run():
         workdir=data_dir,
     )
 
+    # IMPORTANT:
+    # PyTgCalls 2.3.3 supports Pyrogram. The userbot therefore uses
+    # the real Pyrogram client instead of Kurigram.
     userbot = Client(
         "hexiron_userbot",
         api_id=API_ID,
@@ -164,14 +167,25 @@ async def run():
 
     logger.info("HexIron Music starting...")
 
-    await bot.start()
-    await calls.start()
+    try:
+        await bot.start()
+        await calls.start()
 
-    logger.info("HexIron Music is up and running.")
+        logger.info("HexIron Music is up and running.")
 
-    await idle()
+        await idle()
 
-    await bot.stop()
+    finally:
+        # Stop PyTgCalls first, then the bot client.
+        try:
+            await calls.stop()
+        except Exception:
+            logger.exception("Failed to stop PyTgCalls cleanly")
+
+        try:
+            await bot.stop()
+        except Exception:
+            logger.exception("Failed to stop bot cleanly")
 
 
 def main():
