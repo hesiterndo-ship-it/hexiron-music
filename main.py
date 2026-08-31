@@ -231,6 +231,35 @@ async def run():
     )
 
     # =====================================================
+    # NTGCALLS CONNECTION DEBUG
+    # =====================================================
+
+    def _on_ntgcalls_connection_change(chat_id, network_info):
+        try:
+            logger.info(
+                "NTgCalls connection change: chat=%s kind=%s state=%s",
+                chat_id,
+                network_info.kind,
+                network_info.state,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to log NTgCalls connection state."
+            )
+
+    try:
+        calls._binding.on_connection_change(
+            _on_ntgcalls_connection_change
+        )
+        logger.info(
+            "NTgCalls connection-state debug callback enabled."
+        )
+    except Exception:
+        logger.exception(
+            "Could not enable NTgCalls connection-state debug callback."
+        )
+
+    # =====================================================
     # BOT HANDLERS
     # =====================================================
 
