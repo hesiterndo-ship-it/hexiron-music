@@ -1,4 +1,5 @@
-﻿import asyncio
+﻿
+import asyncio
 import logging
 import os
 from functools import partial
@@ -6,6 +7,7 @@ from urllib.parse import urlparse
 
 from pyrogram import Client, filters, idle
 from pyrogram.handlers import MessageHandler
+
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as pytgfilters
 from pytgcalls.types import StreamEnded
@@ -17,8 +19,15 @@ from config import (
     STRING_SESSION,
     validate_config,
 )
+
 from database import init_db
-from handlers.admin import on_added_to_group, panel, start
+
+from handlers.admin import (
+    on_added_to_group,
+    panel,
+    start,
+)
+
 from handlers.player import (
     on_stream_end,
     pause,
@@ -28,8 +37,13 @@ from handlers.player import (
     skip,
     stop,
 )
+
 from utils.ffmpeg_setup import ensure_ffmpeg
 
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,25 +53,59 @@ logging.basicConfig(
 logger = logging.getLogger("hexiron")
 
 
+# =========================================================
+# TELEGRAM PROXY
+# =========================================================
+
 def get_telegram_proxy():
+    """
+    Read SOCKS5 proxy configuration from environment.
+
+    Expected format:
+
+        socks5://HOST:PORT
+
+    or:
+
+        socks5://USERNAME:PASSWORD@HOST:PORT
+
+    Also accepts:
+
+        socks5h://HOST:PORT
+        socks://HOST:PORT
+    """
+
     proxy_url = os.getenv("SOCKS5_PROXY_URL", "").strip()
 
     if not proxy_url:
-        logger.info(
-            "Telegram SOCKS5 proxy is not configured; using direct connection."
+        logger.warning(
+            "Telegram SOCKS5 proxy is NOT configured. "
+            "Bot and Userbot will use direct connection."
         )
         return None
 
-    parsed = urlparse(proxy_url)
+    try:
+        parsed = urlparse(proxy_url)
+    except Exception:
+        logger.exception("Failed to parse SOCKS5_PROXY_URL")
+        raise
 
-    if parsed.scheme.lower() not in ("socks5", "socks5h", "socks"):
+    scheme = parsed.scheme.lower()
+
+    if scheme not in ("socks5", "socks5h", "socks"):
         raise ValueError(
-            f"Unsupported SOCKS5 proxy scheme: {parsed.scheme}"
+            "Unsupported proxy scheme. "
+            f"Expected socks5/socks5h/socks, got: {parsed.scheme!r}"
         )
 
-    if not parsed.hostname or not parsed.port:
+    if not parsed.hostname:
         raise ValueError(
-            "SOCKS5_PROXY_URL must contain hostname and port."
+            "SOCKS5_PROXY_URL must contain a hostname."
+        )
+
+    if not parsed.port:
+        raise ValueError(
+            "SOCKS5_PROXY_URL must contain a port."
         )
 
     proxy = {
@@ -78,21 +126,63 @@ def get_telegram_proxy():
         parsed.port,
     )
 
+    if parsed.username:
+        logger.info(
+            "Telegram SOCKS5 proxy authentication: enabled"
+        )
+    else:
+        logger.info(
+            "Telegram SOCKS5 proxy authentication: disabled"
+        )
+
     return proxy
 
 
+# =========================================================
+# MAIN RUNNER
+# =========================================================
+
 async def run():
+
+    # -----------------------------------------------------
+    # Validate configuration
+    # -----------------------------------------------------
+
     validate_config()
+
+    # -----------------------------------------------------
+    # Initialize database
+    # -----------------------------------------------------
+
     init_db()
+
+    # -----------------------------------------------------
+    # Ensure FFmpeg / FFprobe
+    # -----------------------------------------------------
+
     ensure_ffmpeg()
 
+    # -----------------------------------------------------
+    # Telegram proxy
+    # -----------------------------------------------------
+
     telegram_proxy = get_telegram_proxy()
+
+    # -----------------------------------------------------
+    # Persistent data directory
+    # -----------------------------------------------------
+
     data_dir = os.getenv("DATA_DIR", "/data")
 
-    # ---------------------------------------------------------
+    logger.info(
+        "Using Telegram data directory: %s",
+        data_dir,
+    )
+
+    # =====================================================
     # BOT
-    # Bot همچنان از SOCKS5 استفاده می‌کند.
-    # ---------------------------------------------------------
+    # =====================================================
+
     bot = Client(
         "hexiron_bot",
         api_id=API_ID,
@@ -102,31 +192,56 @@ async def run():
         workdir=data_dir,
     )
 
-    # ---------------------------------------------------------
+    logger.info(
+        "HexIron Bot configured."
+    )
+
+    # =====================================================
     # USERBOT / PYTGCalls
+    # =====================================================
     #
-    # برای تست مشکل Voice Chat، عمداً Proxy را حذف کرده‌ایم.
-    # PyTgCalls از همین userbot برای phone.JoinGroupCall
-    # استفاده می‌کند.
-    # ---------------------------------------------------------
+    # IMPORTANT:
+    #
+    # PyTgCalls uses this Userbot instance.
+    #
+    # Therefore the SAME SOCKS5 proxy must be applied
+    # to the Userbot as well.
+    #
+    # =====================================================
+
     userbot = Client(
         "hexiron_userbot",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=STRING_SESSION,
+        proxy=telegram_proxy,
         workdir=data_dir,
     )
 
-    logger.info(
-        "HexIron userbot is configured WITHOUT SOCKS5 proxy "
-        "for PyTgCalls voice-chat testing."
-    )
+    if telegram_proxy:
+        logger.info(
+            "HexIron Userbot is configured WITH SOCKS5 proxy "
+            "for PyTgCalls."
+        )
+    else:
+        logger.warning(
+            "HexIron Userbot is configured WITHOUT SOCKS5 proxy. "
+            "PyTgCalls will attempt a direct Telegram connection."
+        )
+
+    # =====================================================
+    # PYTGCalls
+    # =====================================================
 
     calls = PyTgCalls(userbot)
 
-    # ---------------------------------------------------------
+    logger.info(
+        "PyTgCalls initialized using HexIron Userbot."
+    )
+
+    # =====================================================
     # BOT HANDLERS
-    # ---------------------------------------------------------
+    # =====================================================
 
     bot.add_handler(
         MessageHandler(
@@ -191,36 +306,110 @@ async def run():
         )
     )
 
+    # =====================================================
+    # STREAM END HANDLER
+    # =====================================================
+
     @calls.on_update(pytgfilters.stream_end())
     async def _on_stream_end(_, update: StreamEnded):
-        await on_stream_end(bot, calls, update.chat_id)
+        await on_stream_end(
+            bot,
+            calls,
+            update.chat_id,
+        )
+
+    # =====================================================
+    # START SERVICES
+    # =====================================================
 
     logger.info("HexIron Music starting...")
 
     try:
-        # Start bot
+
+        # -------------------------------------------------
+        # Start Bot
+        # -------------------------------------------------
+
+        logger.info(
+            "Starting Telegram Bot..."
+        )
+
         await bot.start()
 
-        # Start PyTgCalls / userbot
+        logger.info(
+            "Telegram Bot started successfully."
+        )
+
+        # -------------------------------------------------
+        # Start PyTgCalls / Userbot
+        # -------------------------------------------------
+
+        logger.info(
+            "Starting PyTgCalls / Userbot..."
+        )
+
         await calls.start()
 
-        logger.info("HexIron Music is up and running.")
+        logger.info(
+            "PyTgCalls / Userbot started successfully."
+        )
+
+        # -------------------------------------------------
+        # Application ready
+        # -------------------------------------------------
+
+        logger.info(
+            "HexIron Music is UP and RUNNING."
+        )
 
         await idle()
 
     finally:
-        # Stop PyTgCalls first
+
+        # =================================================
+        # STOP PYTGCalls
+        # =================================================
+
+        logger.info(
+            "Stopping PyTgCalls..."
+        )
+
         try:
             await calls.stop()
-        except Exception:
-            logger.exception("Failed to stop PyTgCalls cleanly")
 
-        # Then stop bot
+            logger.info(
+                "PyTgCalls stopped successfully."
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to stop PyTgCalls cleanly."
+            )
+
+        # =================================================
+        # STOP BOT
+        # =================================================
+
+        logger.info(
+            "Stopping Telegram Bot..."
+        )
+
         try:
             await bot.stop()
-        except Exception:
-            logger.exception("Failed to stop bot cleanly")
 
+            logger.info(
+                "Telegram Bot stopped successfully."
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to stop Telegram Bot cleanly."
+            )
+
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
 def main():
     asyncio.run(run())
