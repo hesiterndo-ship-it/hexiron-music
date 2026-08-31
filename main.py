@@ -1,5 +1,4 @@
-﻿
-import asyncio
+﻿import asyncio
 import logging
 import os
 from functools import partial
@@ -120,6 +119,7 @@ def get_telegram_proxy():
     if parsed.password:
         proxy["password"] = parsed.password
 
+    # Never log username/password.
     logger.info(
         "Telegram SOCKS5 proxy enabled: %s:%s",
         parsed.hostname,
@@ -198,15 +198,6 @@ async def run():
 
     # =====================================================
     # USERBOT / PYTGCalls
-    # =====================================================
-    #
-    # IMPORTANT:
-    #
-    # PyTgCalls uses this Userbot instance.
-    #
-    # Therefore the SAME SOCKS5 proxy must be applied
-    # to the Userbot as well.
-    #
     # =====================================================
 
     userbot = Client(
