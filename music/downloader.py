@@ -1,439 +1,386 @@
-import asyncio
 import logging
 import os
-from functools import partial
 from urllib.parse import urlparse
 
-from pyrogram import Client, filters, idle
-from pyrogram.handlers import MessageHandler
+import requests
+import socks
+from radiojavanapi import Client as RJClient
 
-from pytgcalls import PyTgCalls
-from pytgcalls import filters as pytgfilters
-from pytgcalls.types import StreamEnded
 
-from config import (
-    API_HASH,
-    API_ID,
-    BOT_TOKEN,
-    STRING_SESSION,
-    validate_config,
+logger = logging.getLogger("hexiron.downloader")
+
+
+DOWNLOAD_DIR = os.path.join(
+    os.getenv("DATA_DIR", "/data"),
+    "downloads",
 )
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-from database import init_db
-
-from handlers.admin import (
-    on_added_to_group,
-    panel,
-    start,
-)
-
-from handlers.player import (
-    on_stream_end,
-    pause,
-    play,
-    queue_list,
-    resume,
-    skip,
-    stop,
-)
-
-from utils.ffmpeg_setup import ensure_ffmpeg
+_rj = RJClient()
 
 
-# =========================================================
-# LOGGING
-# =========================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger("hexiron")
+# Default request timeouts for RadioJavan API calls.
+RJ_CONNECT_TIMEOUT = float(os.getenv("RJ_CONNECT_TIMEOUT", "10"))
+RJ_READ_TIMEOUT = float(os.getenv("RJ_READ_TIMEOUT", "30"))
+RJ_TIMEOUT = (RJ_CONNECT_TIMEOUT, RJ_READ_TIMEOUT)
 
 
-# =========================================================
-# TELEGRAM PROXY
-# =========================================================
 
-def get_telegram_proxy():
-    """
-    Read SOCKS5 proxy configuration from environment.
+def _get_proxy_url():
+    return os.getenv("SOCKS5_PROXY_URL", "").strip() or None
 
-    Expected format:
 
-        socks5://HOST:PORT
 
-    or:
+def _configure_radiojavan():
+    """Configure RadioJavan API requests to use the application SOCKS5 proxy.
 
-        socks5://USERNAME:PASSWORD@HOST:PORT
+    radiojavanapi's Client.set_proxy() expects a dictionary such as:
+        {"http": "socks5://host:port", "https": "socks5://host:port"}
 
-    Also accepts:
-
-        socks5h://HOST:PORT
-        socks://HOST:PORT
+    The library uses requests.Session internally. We also add finite
+    connect/read timeouts to that session so a blocked API request cannot
+    leave the Telegram bot stuck on "در حال جستجو" forever.
     """
 
-    proxy_url = os.getenv("SOCKS5_PROXY_URL", "").strip()
+    proxy_url = _get_proxy_url()
 
     if not proxy_url:
-        logger.warning(
-            "Telegram SOCKS5 proxy is NOT configured. "
-            "Bot and Userbot will use direct connection."
-        )
-        return None
-
-    try:
-        parsed = urlparse(proxy_url)
-    except Exception:
-        logger.exception("Failed to parse SOCKS5_PROXY_URL")
-        raise
-
-    scheme = parsed.scheme.lower()
-
-    if scheme not in ("socks5", "socks5h", "socks"):
-        raise ValueError(
-            "Unsupported proxy scheme. "
-            f"Expected socks5/socks5h/socks, got: {parsed.scheme!r}"
+        raise RuntimeError(
+            "SOCKS5_PROXY_URL is not configured. "
+            "RadioJavan API/search requires the configured SOCKS5 proxy on Liara."
         )
 
-    if not parsed.hostname:
-        raise ValueError(
-            "SOCKS5_PROXY_URL must contain a hostname."
+    parsed = urlparse(proxy_url)
+
+    if parsed.scheme.lower() not in ("socks5", "socks5h"):
+        raise RuntimeError(
+            f"Unsupported SOCKS5 proxy scheme: {parsed.scheme!r}. "
+            "Use socks5:// or socks5h://"
         )
 
-    if not parsed.port:
-        raise ValueError(
-            "SOCKS5_PROXY_URL must contain a port."
-        )
+    if not parsed.hostname or not parsed.port:
+        raise RuntimeError("Invalid SOCKS5_PROXY_URL")
 
-    proxy = {
-        "scheme": "socks5",
-        "hostname": parsed.hostname,
-        "port": parsed.port,
-    }
+    # radiojavanapi officially expects a dict for set_proxy().
+    _rj.set_proxy(
+        {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+    )
 
-    if parsed.username:
-        proxy["username"] = parsed.username
+    # radiojavanapi internally calls requests.Session.get/post without a
+    # timeout. Wrap only this client's bound methods and preserve callers'
+    # explicit timeout if one is ever supplied.
+    original_get = _rj.private.get
+    original_post = _rj.private.post
 
-    if parsed.password:
-        proxy["password"] = parsed.password
+    def get_with_timeout(url, **kwargs):
+        kwargs.setdefault("timeout", RJ_TIMEOUT)
+        return original_get(url, **kwargs)
 
-    # Never log username/password.
+    def post_with_timeout(url, **kwargs):
+        kwargs.setdefault("timeout", RJ_TIMEOUT)
+        return original_post(url, **kwargs)
+
+    _rj.private.get = get_with_timeout
+    _rj.private.post = post_with_timeout
+
     logger.info(
-        "Telegram SOCKS5 proxy enabled: %s:%s",
+        "RadioJavan API proxy enabled: %s:%s",
         parsed.hostname,
         parsed.port,
     )
-
-    if parsed.username:
-        logger.info(
-            "Telegram SOCKS5 proxy authentication: enabled"
-        )
-    else:
-        logger.info(
-            "Telegram SOCKS5 proxy authentication: disabled"
-        )
-
-    return proxy
-
-
-# =========================================================
-# MAIN RUNNER
-# =========================================================
-
-async def run():
-
-    # -----------------------------------------------------
-    # Validate configuration
-    # -----------------------------------------------------
-
-    validate_config()
-
-    # -----------------------------------------------------
-    # Initialize database
-    # -----------------------------------------------------
-
-    init_db()
-
-    # -----------------------------------------------------
-    # Ensure FFmpeg / FFprobe
-    # -----------------------------------------------------
-
-    ensure_ffmpeg()
-
-    # -----------------------------------------------------
-    # Telegram proxy
-    # -----------------------------------------------------
-
-    telegram_proxy = get_telegram_proxy()
-
-    # -----------------------------------------------------
-    # Persistent data directory
-    # -----------------------------------------------------
-
-    data_dir = os.getenv("DATA_DIR", "/data")
-
     logger.info(
-        "Using Telegram data directory: %s",
-        data_dir,
+        "RadioJavan API timeout configured: connect=%ss read=%ss",
+        RJ_CONNECT_TIMEOUT,
+        RJ_READ_TIMEOUT,
     )
 
-    # =====================================================
-    # BOT
-    # =====================================================
 
-    bot = Client(
-        "hexiron_bot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        proxy=telegram_proxy,
-        workdir=data_dir,
-    )
+_configure_radiojavan()
 
-    logger.info(
-        "HexIron Bot configured."
-    )
 
-    # =====================================================
-    # USERBOT / PYTGCalls
-    # =====================================================
 
-    userbot = Client(
-        "hexiron_userbot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=STRING_SESSION,
-        proxy=telegram_proxy,
-        workdir=data_dir,
-    )
+def _cache_path(song_id) -> str:
+    return os.path.join(DOWNLOAD_DIR, f"rj_{song_id}.m4a")
 
-    if telegram_proxy:
-        logger.info(
-            "HexIron Userbot is configured WITH SOCKS5 proxy "
-            "for PyTgCalls."
-        )
-    else:
-        logger.warning(
-            "HexIron Userbot is configured WITHOUT SOCKS5 proxy. "
-            "PyTgCalls will attempt a direct Telegram connection."
+
+
+def _download_via_socks5(url: str, destination: str):
+    """
+    Download a RadioJavan media file through the configured SOCKS5 proxy.
+
+    This uses a raw SOCKS5 socket instead of requests' SOCKS adapter,
+    because the Liara -> proxy -> RadioJavan CDN path has proven to work
+    reliably at the socket/TLS level.
+    """
+    proxy_url = _get_proxy_url()
+    if not proxy_url:
+        raise RuntimeError(
+            "SOCKS5_PROXY_URL is not configured. "
+            "RadioJavan media CDN is unreachable directly from Liara."
         )
 
-    # =====================================================
-    # PYTGCalls
-    # =====================================================
+    proxy = urlparse(proxy_url)
 
-    calls = PyTgCalls(userbot)
+    if proxy.scheme.lower() not in ("socks5", "socks5h"):
+        raise RuntimeError(
+            f"Unsupported proxy scheme: {proxy.scheme}. "
+            "SOCKS5_PROXY_URL must start with socks5://"
+        )
 
-    logger.info(
-        "PyTgCalls initialized using HexIron Userbot."
+    target = urlparse(url)
+    if target.scheme.lower() != "https":
+        raise RuntimeError(
+            f"Unsupported media URL scheme: {target.scheme}"
+        )
+
+    proxy_host = proxy.hostname
+    proxy_port = proxy.port
+
+    if not proxy_host or not proxy_port:
+        raise RuntimeError("Invalid SOCKS5_PROXY_URL")
+
+    # Connect through SOCKS5.
+    sock = socks.socksocket()
+    sock.set_proxy(
+        socks.SOCKS5,
+        proxy_host,
+        proxy_port,
+        username=proxy.username,
+        password=proxy.password,
     )
-
-    # =====================================================
-    # NTGCALLS CONNECTION DEBUG
-    # =====================================================
-
-    def _on_ntgcalls_connection_change(chat_id, network_info):
-        try:
-            logger.info(
-                "NTgCalls connection change: chat=%s kind=%s state=%s",
-                chat_id,
-                network_info.kind,
-                network_info.state,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to log NTgCalls connection state."
-            )
+    sock.settimeout(60)
 
     try:
-        calls._binding.on_connection_change(
-            _on_ntgcalls_connection_change
-        )
-        logger.info(
-            "NTgCalls connection-state debug callback enabled."
-        )
+        sock.connect((target.hostname, target.port or 443))
+
+        import ssl
+
+        context = ssl.create_default_context()
+
+        with context.wrap_socket(
+            sock,
+            server_hostname=target.hostname,
+        ) as conn:
+            path = target.path or "/"
+
+            if target.query:
+                path += "?" + target.query
+
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {target.hostname}\r\n"
+                "User-Agent: Mozilla/5.0\r\n"
+                "Accept: */*\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            )
+
+            conn.sendall(request.encode("ascii"))
+
+            # Read HTTP headers.
+            buffer = b""
+            while b"\r\n\r\n" not in buffer:
+                chunk = conn.recv(4096)
+
+                if not chunk:
+                    raise RuntimeError(
+                        "RadioJavan CDN closed the connection "
+                        "before sending HTTP headers."
+                    )
+
+                buffer += chunk
+
+                if len(buffer) > 64 * 1024:
+                    raise RuntimeError(
+                        "HTTP headers are unexpectedly large."
+                    )
+
+            header_bytes, body = buffer.split(
+                b"\r\n\r\n",
+                1,
+            )
+
+            headers_text = header_bytes.decode(
+                "iso-8859-1",
+                errors="replace",
+            )
+
+            header_lines = headers_text.split("\r\n")
+
+            status_line = header_lines[0]
+            try:
+                status_code = int(status_line.split()[1])
+            except (IndexError, ValueError):
+                raise RuntimeError(
+                    f"Invalid HTTP response from RadioJavan: "
+                    f"{status_line}"
+                )
+
+            if status_code < 200 or status_code >= 300:
+                raise RuntimeError(
+                    f"RadioJavan CDN returned HTTP {status_code}: "
+                    f"{status_line}"
+                )
+
+            content_length = None
+
+            for line in header_lines[1:]:
+                if ":" not in line:
+                    continue
+
+                key, value = line.split(":", 1)
+
+                if key.lower().strip() == "content-length":
+                    try:
+                        content_length = int(value.strip())
+                    except ValueError:
+                        pass
+
+            temp_path = destination + ".part"
+            total = 0
+            try:
+                with open(temp_path, "wb") as f:
+
+                    if body:
+                        f.write(body)
+                        total += len(body)
+
+                    while True:
+                        chunk = conn.recv(1024 * 1024)
+
+                        if not chunk:
+                            break
+
+                        f.write(chunk)
+                        total += len(chunk)
+
+                if content_length is not None and total != content_length:
+                    raise RuntimeError(
+                        f"Incomplete RadioJavan download: "
+                        f"{total}/{content_length} bytes"
+                    )
+
+                os.replace(temp_path, destination)
+
+            except Exception:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                raise
+
+            return total
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+
+def search_and_download(query: str) -> dict:
+    """
+    Search RadioJavan and download the first result.
+
+    Result shape:
+    {
+        "title": str,
+        "duration": int,
+        "file_path": str,
+        "video_id": str
+    }
+    """
+
+    query = (query or "").strip()
+
+    if not query:
+        raise ValueError("Search query is empty.")
+
+    logger.info("RadioJavan search started: %r", query[:120])
+
+    try:
+        results = _rj.search(query)
     except Exception:
         logger.exception(
-            "Could not enable NTgCalls connection-state debug callback."
+            "RadioJavan search failed for %r",
+            query[:120],
         )
+        raise
 
-    # =====================================================
-    # BOT HANDLERS
-    # =====================================================
-
-    bot.add_handler(
-        MessageHandler(
-            start,
-            filters.command("start") & filters.private,
-        )
+    logger.info(
+        "RadioJavan search finished: %d songs",
+        len(results.songs),
     )
 
-    bot.add_handler(
-        MessageHandler(
-            panel,
-            filters.command("admin"),
-        )
+    if not results.songs:
+        return None
+
+    short = results.songs[0]
+
+    logger.info(
+        "RadioJavan result selected: id=%s",
+        short.id,
     )
-
-    bot.add_handler(
-        MessageHandler(
-            on_added_to_group,
-            filters.new_chat_members,
-        )
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            partial(play, calls=calls),
-            filters.command("play"),
-        )
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            partial(pause, calls=calls),
-            filters.command("pause"),
-        )
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            partial(resume, calls=calls),
-            filters.command("resume"),
-        )
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            partial(skip, calls=calls),
-            filters.command("skip"),
-        )
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            partial(stop, calls=calls),
-            filters.command("stop"),
-        )
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            queue_list,
-            filters.command("queue"),
-        )
-    )
-
-    # =====================================================
-    # STREAM END HANDLER
-    # =====================================================
-
-    @calls.on_update(pytgfilters.stream_end())
-    async def _on_stream_end(_, update: StreamEnded):
-        await on_stream_end(
-            bot,
-            calls,
-            update.chat_id,
-        )
-
-    # =====================================================
-    # START SERVICES
-    # =====================================================
-
-    logger.info("HexIron Music starting...")
 
     try:
-
-        # -------------------------------------------------
-        # Start Bot
-        # -------------------------------------------------
-
-        logger.info(
-            "Starting Telegram Bot..."
+        song = _rj.get_song_by_id(short.id)
+    except Exception:
+        logger.exception(
+            "RadioJavan song-details request failed: id=%s",
+            short.id,
         )
+        raise
 
-        await bot.start()
+    logger.info(
+        "RadioJavan song details loaded: id=%s title=%r",
+        song.id,
+        song.name,
+    )
 
-        logger.info(
-            "Telegram Bot started successfully."
-        )
+    cached = _cache_path(song.id)
 
-        # -------------------------------------------------
-        # Start PyTgCalls / Userbot
-        # -------------------------------------------------
+    title = (
+        f"{song.artist} - {song.name}"
+        if song.artist
+        else song.name
+    )
 
-        logger.info(
-            "Starting PyTgCalls / Userbot..."
-        )
+    if not os.path.exists(cached):
+        link = song.hq_link or song.lq_link
 
-        await calls.start()
-
-        logger.info(
-            "PyTgCalls / Userbot started successfully."
-        )
-
-        # -------------------------------------------------
-        # Application ready
-        # -------------------------------------------------
-
-        logger.info(
-            "HexIron Music is UP and RUNNING."
-        )
-
-        await idle()
-
-    finally:
-
-        # =================================================
-        # STOP PYTGCalls
-        # =================================================
-
-        logger.info(
-            "Stopping PyTgCalls..."
-        )
-
-        try:
-            await calls.stop()
-
-            logger.info(
-                "PyTgCalls stopped successfully."
+        if not link:
+            raise RuntimeError(
+                "RadioJavan returned no downloadable media link."
             )
 
-        except Exception:
-            logger.exception(
-                "Failed to stop PyTgCalls cleanly."
-            )
-
-        # =================================================
-        # STOP BOT
-        # =================================================
+        link = str(link)
 
         logger.info(
-            "Stopping Telegram Bot..."
+            "Downloading RadioJavan media: song_id=%s",
+            song.id,
         )
 
-        try:
-            await bot.stop()
+        downloaded_bytes = _download_via_socks5(
+            link,
+            cached,
+        )
 
-            logger.info(
-                "Telegram Bot stopped successfully."
-            )
+        logger.info(
+            "RadioJavan media download complete: %d bytes",
+            downloaded_bytes,
+        )
+    else:
+        logger.info(
+            "Using cached RadioJavan media: %s",
+            cached,
+        )
 
-        except Exception:
-            logger.exception(
-                "Failed to stop Telegram Bot cleanly."
-            )
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
-
-def main():
-    asyncio.run(run())
-
-
-if __name__ == "__main__":
-    main()
+    return {
+        "title": title,
+        "duration": song.duration,
+        "file_path": cached,
+        "video_id": str(song.id),
+    }
