@@ -1,4 +1,11 @@
-﻿import asyncio
+"""
+HexIron Music Bot — main entry point.
+
+Initialises the Telegram bot, PyTgCalls userbot, database, and all
+handlers.  Runs periodic cleanup tasks and shuts down gracefully.
+"""
+
+import asyncio
 import logging
 import os
 from functools import partial
@@ -16,17 +23,19 @@ from config import (
     API_ID,
     BOT_TOKEN,
     STRING_SESSION,
+    LOG_LEVEL,
+    CLEANUP_INTERVAL_MINUTES,
     validate_config,
+    ensure_directories,
 )
 
 from database import init_db
 
 from handlers.admin import (
     on_added_to_group,
-    panel,
     start,
+    register_admin_handlers,
 )
-
 from handlers.player import (
     on_stream_end,
     pause,
@@ -35,7 +44,12 @@ from handlers.player import (
     resume,
     skip,
     stop,
+    handle_audio_upload,
 )
+from handlers.control_panel import register_panel_handlers
+from handlers.search import register_search_handlers
+
+from services.storage import cleanup_temp_files, cleanup_stale_downloads
 
 from utils.ffmpeg_setup import ensure_ffmpeg
 
@@ -46,7 +60,7 @@ from utils.ffmpeg_setup import ensure_ffmpeg
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 
 logger = logging.getLogger("hexiron")
@@ -55,6 +69,7 @@ logger = logging.getLogger("hexiron")
 # =========================================================
 # TELEGRAM PROXY
 # =========================================================
+
 
 def get_telegram_proxy():
     """
@@ -73,8 +88,9 @@ def get_telegram_proxy():
         socks5h://HOST:PORT
         socks://HOST:PORT
     """
+    from config import SOCKS5_PROXY_URL
 
-    proxy_url = os.getenv("SOCKS5_PROXY_URL", "").strip()
+    proxy_url = SOCKS5_PROXY_URL
 
     if not proxy_url:
         logger.warning(
@@ -98,14 +114,10 @@ def get_telegram_proxy():
         )
 
     if not parsed.hostname:
-        raise ValueError(
-            "SOCKS5_PROXY_URL must contain a hostname."
-        )
+        raise ValueError("SOCKS5_PROXY_URL must contain a hostname.")
 
     if not parsed.port:
-        raise ValueError(
-            "SOCKS5_PROXY_URL must contain a port."
-        )
+        raise ValueError("SOCKS5_PROXY_URL must contain a port.")
 
     proxy = {
         "scheme": "socks5",
@@ -119,28 +131,38 @@ def get_telegram_proxy():
     if parsed.password:
         proxy["password"] = parsed.password
 
-    # Never log username/password.
     logger.info(
         "Telegram SOCKS5 proxy enabled: %s:%s",
         parsed.hostname,
         parsed.port,
     )
 
-    if parsed.username:
-        logger.info(
-            "Telegram SOCKS5 proxy authentication: enabled"
-        )
-    else:
-        logger.info(
-            "Telegram SOCKS5 proxy authentication: disabled"
-        )
-
     return proxy
+
+
+# =========================================================
+# PERIODIC CLEANUP
+# =========================================================
+
+
+async def periodic_cleanup():
+    """Run storage cleanup tasks periodically."""
+    while True:
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL_MINUTES * 60)
+            logger.info("Running periodic cleanup...")
+            cleanup_temp_files()
+            cleanup_stale_downloads()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("Periodic cleanup failed")
 
 
 # =========================================================
 # MAIN RUNNER
 # =========================================================
+
 
 async def run():
 
@@ -149,6 +171,12 @@ async def run():
     # -----------------------------------------------------
 
     validate_config()
+
+    # -----------------------------------------------------
+    # Create directories
+    # -----------------------------------------------------
+
+    ensure_directories()
 
     # -----------------------------------------------------
     # Initialize database
@@ -172,12 +200,9 @@ async def run():
     # Persistent data directory
     # -----------------------------------------------------
 
-    data_dir = os.getenv("DATA_DIR", "/data")
+    from config import DATA_DIR
 
-    logger.info(
-        "Using Telegram data directory: %s",
-        data_dir,
-    )
+    logger.info("Using Telegram data directory: %s", DATA_DIR)
 
     # =====================================================
     # BOT
@@ -189,12 +214,10 @@ async def run():
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
         proxy=telegram_proxy,
-        workdir=data_dir,
+        workdir=DATA_DIR,
     )
 
-    logger.info(
-        "HexIron Bot configured."
-    )
+    logger.info("HexIron Bot configured.")
 
     # =====================================================
     # USERBOT / PYTGCalls
@@ -206,7 +229,7 @@ async def run():
         api_hash=API_HASH,
         session_string=STRING_SESSION,
         proxy=telegram_proxy,
-        workdir=data_dir,
+        workdir=DATA_DIR,
     )
 
     if telegram_proxy:
@@ -226,9 +249,7 @@ async def run():
 
     calls = PyTgCalls(userbot)
 
-    logger.info(
-        "PyTgCalls initialized using HexIron Userbot."
-    )
+    logger.info("PyTgCalls initialized using HexIron Userbot.")
 
     # =====================================================
     # NTGCALLS CONNECTION DEBUG
@@ -251,9 +272,7 @@ async def run():
         calls._binding.on_connection_change(
             _on_ntgcalls_connection_change
         )
-        logger.info(
-            "NTgCalls connection-state debug callback enabled."
-        )
+        logger.info("NTgCalls connection-state debug callback enabled.")
     except Exception:
         logger.exception(
             "Could not enable NTgCalls connection-state debug callback."
@@ -263,17 +282,11 @@ async def run():
     # BOT HANDLERS
     # =====================================================
 
+    # --- Admin & start ---
     bot.add_handler(
         MessageHandler(
             start,
             filters.command("start") & filters.private,
-        )
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            panel,
-            filters.command("admin"),
         )
     )
 
@@ -284,6 +297,7 @@ async def run():
         )
     )
 
+    # --- Player commands ---
     bot.add_handler(
         MessageHandler(
             partial(play, calls=calls),
@@ -326,6 +340,19 @@ async def run():
         )
     )
 
+    # --- Audio upload handler ---
+    bot.add_handler(
+        MessageHandler(
+            partial(handle_audio_upload, calls=calls),
+            (filters.audio | filters.document) & filters.chat_type.groups,
+        )
+    )
+
+    # --- Callback-based handlers (panel, admin, search) ---
+    register_panel_handlers(bot, calls)
+    register_admin_handlers(bot, calls)
+    register_search_handlers(bot, calls)
+
     # =====================================================
     # STREAM END HANDLER
     # =====================================================
@@ -344,92 +371,82 @@ async def run():
 
     logger.info("HexIron Music starting...")
 
+    cleanup_task = None
+
     try:
 
-        # -------------------------------------------------
+        # ---------------------------------
         # Start Bot
-        # -------------------------------------------------
+        # ---------------------------------
 
-        logger.info(
-            "Starting Telegram Bot..."
-        )
-
+        logger.info("Starting Telegram Bot...")
         await bot.start()
+        logger.info("Telegram Bot started successfully.")
 
-        logger.info(
-            "Telegram Bot started successfully."
-        )
-
-        # -------------------------------------------------
+        # ---------------------------------
         # Start PyTgCalls / Userbot
-        # -------------------------------------------------
+        # ---------------------------------
 
-        logger.info(
-            "Starting PyTgCalls / Userbot..."
-        )
-
+        logger.info("Starting PyTgCalls / Userbot...")
         await calls.start()
+        logger.info("PyTgCalls / Userbot started successfully.")
 
-        logger.info(
-            "PyTgCalls / Userbot started successfully."
-        )
+        # ---------------------------------
+        # Start periodic cleanup
+        # ---------------------------------
 
-        # -------------------------------------------------
+        cleanup_task = asyncio.create_task(periodic_cleanup())
+
+        # ---------------------------------
         # Application ready
-        # -------------------------------------------------
+        # ---------------------------------
 
-        logger.info(
-            "HexIron Music is UP and RUNNING."
-        )
+        logger.info("HexIron Music is UP and RUNNING.")
 
         await idle()
 
     finally:
 
-        # =================================================
-        # STOP PYTGCalls
-        # =================================================
+        # ========================================
+        # STOP CLEANUP TASK
+        # ========================================
 
-        logger.info(
-            "Stopping PyTgCalls..."
-        )
+        if cleanup_task:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+        # ========================================
+        # STOP PYTGCalls
+        # ========================================
+
+        logger.info("Stopping PyTgCalls...")
 
         try:
             await calls.stop()
-
-            logger.info(
-                "PyTgCalls stopped successfully."
-            )
-
+            logger.info("PyTgCalls stopped successfully.")
         except Exception:
-            logger.exception(
-                "Failed to stop PyTgCalls cleanly."
-            )
+            logger.exception("Failed to stop PyTgCalls cleanly.")
 
-        # =================================================
+        # ========================================
         # STOP BOT
-        # =================================================
+        # ========================================
 
-        logger.info(
-            "Stopping Telegram Bot..."
-        )
+        logger.info("Stopping Telegram Bot...")
 
         try:
             await bot.stop()
-
-            logger.info(
-                "Telegram Bot stopped successfully."
-            )
-
+            logger.info("Telegram Bot stopped successfully.")
         except Exception:
-            logger.exception(
-                "Failed to stop Telegram Bot cleanly."
-            )
+            logger.exception("Failed to stop Telegram Bot cleanly.")
 
 
 # =========================================================
 # ENTRY POINT
 # =========================================================
+
 
 def main():
     asyncio.run(run())
