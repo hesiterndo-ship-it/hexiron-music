@@ -123,7 +123,20 @@ def init_db():
                 "ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
             )
 
-        # Create the index only AFTER sort_order is guaranteed to exist.
+        # Migrate existing databases created by older versions.
+        # Older queue tables may not have the sort_order column.
+        queue_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(queue)").fetchall()
+        }
+
+        if "sort_order" not in queue_columns:
+            conn.execute(
+                "ALTER TABLE queue "
+                "ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # Create the index only after sort_order is guaranteed to exist.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_queue_chat "
             "ON queue(chat_id, sort_order)"
@@ -142,6 +155,7 @@ def register_group(chat_id: int, title: str):
             "VALUES (?, ?, 1, datetime('now'), datetime('now'))",
             (chat_id, title),
         )
+
         conn.commit()
 
 
