@@ -56,7 +56,7 @@ def _cleanup_expired_cache():
 # ── Register handlers ──────────────────────────────────────────────
 
 
-def register_search_handlers(bot: Client, calls):
+def register_search_handlers(bot, calls):
     """Register search-related handlers."""
     # No additional message handlers needed — search is handled via
     # /search in admin.py and result selection in control_panel.py.

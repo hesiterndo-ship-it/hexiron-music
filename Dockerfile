@@ -5,33 +5,39 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install FFmpeg + FFprobe required for audio playback
+# CA certificates are required for HTTPS downloads
+# FFmpeg is installed at runtime by utils/ffmpeg_setup.py
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
-RUN groupadd -r hexiron && useradd -r -g hexiron -d /app hexiron
+# Create non-root user
+RUN groupadd -r hexiron \
+    && useradd -r -g hexiron -d /app hexiron
 
-# Create required directories
-RUN mkdir -p /data/storage /data/temp /data/downloads /data/uploads /data/cache /data/logs \
+# Persistent/runtime directories
+RUN mkdir -p \
+        /data/storage \
+        /data/temp \
+        /data/downloads \
+        /data/uploads \
+        /data/cache \
+        /data/logs \
+        /data/bin \
     && chown -R hexiron:hexiron /data /app
 
+# Install Python dependencies
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 
+# Copy application
 COPY . .
 
-# Ensure the app owns its files
+# Ensure application files are owned by the runtime user
 RUN chown -R hexiron:hexiron /app
 
 USER hexiron
-
-# Health check: verify the Python process is running
-HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \
-    CMD pgrep -f "python main.py" || exit 1
 
 CMD ["python", "main.py"]
