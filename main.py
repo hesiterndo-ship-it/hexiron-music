@@ -387,7 +387,11 @@ async def run():
         # Start PyTgCalls / Userbot
         # ---------------------------------
 
-        logger.info("Starting PyTgCalls / Userbot...")
+        logger.info("Starting Userbot session...")
+        await userbot.start()
+        logger.info("Userbot started successfully.")
+
+        logger.info("Starting PyTgCalls...")
         await calls.start()
         logger.info("PyTgCalls / Userbot started successfully.")
 
@@ -441,6 +445,18 @@ async def run():
             logger.info("Telegram Bot stopped successfully.")
         except Exception:
             logger.exception("Failed to stop Telegram Bot cleanly.")
+
+        # ========================================
+        # STOP USERBOT
+        # ========================================
+
+        logger.info("Stopping Userbot session...")
+
+        try:
+            await userbot.stop()
+            logger.info("Userbot stopped successfully.")
+        except Exception:
+            logger.exception("Failed to stop Userbot cleanly.")
 
 
 # =========================================================
