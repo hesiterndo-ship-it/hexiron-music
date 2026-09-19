@@ -1,4 +1,4 @@
-"""
+﻿"""
 HexIron Music Bot — main entry point.
 
 Initialises the Telegram bot, PyTgCalls userbot, database, and all
@@ -40,6 +40,7 @@ from handlers.player import (
     on_stream_end,
     pause,
     play,
+    previous,
     queue_list,
     resume,
     skip,
@@ -323,6 +324,13 @@ async def run():
         MessageHandler(
             partial(skip, calls=calls),
             filters.command("skip"),
+        )
+    )
+
+    bot.add_handler(
+        MessageHandler(
+            partial(previous, calls=calls),
+            filters.command(["previous", "prev", "back"]),
         )
     )
 

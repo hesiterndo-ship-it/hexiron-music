@@ -476,6 +476,9 @@ async def skip_track(
         except Exception as e:
             logger.exception("Replay failed in chat %s", chat_id)
 
+    # Remember what we're leaving behind so ⏮ Previous can bring it back
+    state.push_history(state.now_playing)
+
     # Pop next from queue
     nxt = database.pop_next(chat_id)
 
@@ -544,6 +547,66 @@ async def skip_track(
 
 async def skip(client: Client, message: Message, calls: PyTgCalls):
     await skip_track(client, message, calls, message.chat.id)
+
+
+# ── play_previous (⏮ button / /previous command) ──────────────────────
+
+
+async def play_previous(
+    client: Client,
+    message: Message,
+    calls: PyTgCalls,
+    chat_id: int,
+):
+    """
+    Go back to the previously played track.
+
+    The current track (if any) is pushed back to the front of the queue
+    so a later ⏭ Skip returns exactly where playback was.
+    """
+    state = get_state(chat_id)
+    prev = state.pop_history()
+
+    if prev is None:
+        await message.reply_text("⏮ No previous track in this session.")
+        return
+
+    # Put the currently playing track back at the front of the queue
+    if state.now_playing:
+        np = state.now_playing
+        qid = database.add_to_queue(
+            chat_id, np.title, np.file_path, np.requested_by,
+            artist=np.artist, duration=np.duration, source=np.source,
+        )
+        database.move_queue_item(chat_id, qid, 0)
+
+    try:
+        stream = _build_stream(prev.file_path)
+        await calls.play(chat_id, stream)
+
+        active_chats.add(chat_id)
+        state.is_playing = True
+        state.is_paused = False
+        prev.started_at = time.time()
+        state.now_playing = prev
+
+        from handlers.control_panel import send_or_update_panel
+        await send_or_update_panel(client, chat_id, state.player_message_id)
+
+        logger.info("Went back to previous track in chat %s: %s", chat_id, prev.title)
+
+    except Exception as e:
+        active_chats.discard(chat_id)
+        state.is_playing = False
+        state.now_playing = None
+        logger.exception("Previous-track playback failed in chat %s", chat_id)
+        await message.reply_text(
+            f"❌ Error playing previous track:\n{type(e).__name__}: {e}"
+        )
+
+
+async def previous(client: Client, message: Message, calls: PyTgCalls):
+    await play_previous(client, message, calls, message.chat.id)
 
 
 # ── stop_playback (also callable from control panel) ──────────────────
@@ -630,6 +693,9 @@ async def on_stream_end(client: Client, calls: PyTgCalls, chat_id: int):
             return
         except Exception as e:
             logger.exception("Replay failed in chat %s", chat_id)
+
+    # Remember what we're leaving behind so ⏮ Previous can bring it back
+    state.push_history(state.now_playing)
 
     # Pop next from queue
     nxt = database.pop_next(chat_id)

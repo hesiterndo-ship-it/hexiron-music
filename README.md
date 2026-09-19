@@ -208,8 +208,10 @@ See `.env.example` for the complete list.
 | `/skip` | Skip to next song |
 | `/stop` | Stop and clear queue |
 | `/queue` | View the queue |
+| `/previous` (or `/prev`, `/back`) | Go back to the previously played track |
 | `/panel` | Open interactive control panel |
 | `/search <query>` | Search for music (shows selectable results) |
+| `/aiplay <feeling/style>` | AI-assisted search (requires AI provider configured) |
 | `/fav` | View your favorites |
 
 ### Admin Commands
@@ -222,11 +224,19 @@ See `.env.example` for the complete list.
 ### Control Panel
 
 Use `/panel` to open the interactive keyboard:
-- ▶️ Play/Resume, ⏸ Pause, ⏭ Skip, ⏹ Stop
-- 📜 Queue, 🎧 Now Playing, ❤️ Save to Favorites
-- 🔁 Loop (Off / Current Song / Queue), 🔀 Shuffle
+- ⏮ Previous, ▶️ Play/Resume, ⏭ Next, ⏹ Stop
+- 📜 Queue, 🎧 Now Playing, 📤 Upload hint, ❤️ Save to Favorites
+- 🔁 Loop (Off / Current Song / Queue), 🔀 Shuffle, 🤖 AI suggestion hint
 - 🔊 Volume control (Mute / - / + / Max)
-- ➕ Add Song, 🔄 Refresh, ❌ Close
+- 🔄 Refresh, ❌ Close
+
+"Previous" replays the last track from this session's history and puts the
+song that was playing back at the front of the queue, so a later "Next"
+returns exactly where you left off.
+
+See `DEPLOY-LIARA-VPS.md` for a full walkthrough of deploying this bot
+together with `hexiron-sales` (subscription/licensing) on a Liara VPS,
+and wiring up Liara AI.
 
 ## Deployment
 

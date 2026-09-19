@@ -47,9 +47,11 @@ def _build_now_playing_text(chat_id: int) -> str:
 
     if not state.is_playing or not state.now_playing:
         return (
-            "🎵 <b>HEXIRON MUSIC</b>\n\n"
+            "◈─────── <b>HEXIRON MUSIC</b> ───────◈\n\n"
             "No song playing.\n"
-            "Use /play &lt;song name&gt; to start!"
+            "Use /play &lt;song name&gt; to start, or just send an "
+            "audio file 📤\n\n"
+            "◈──────────────────────────────◈"
         )
 
     np = state.now_playing
@@ -67,26 +69,42 @@ def _build_now_playing_text(chat_id: int) -> str:
     # Queue count
     q_len = database.queue_length(chat_id)
 
+    # Progress bar (glass-style — filled/empty blocks)
+    bar = _progress_bar(np.elapsed, np.duration)
+
     lines = [
-        f"🎧 <b>NOW PLAYING</b>\n",
-        f"🎵 {escape_html(np.title)}",
+        "◈─────── <b>HEXIRON MUSIC</b> ───────◈\n",
+        f"🎵 <b>{escape_html(np.title)}</b>",
     ]
 
     if np.artist:
         lines.append(f"👤 {escape_html(np.artist)}")
 
-    lines.append(f"\n⏱ {elapsed} / {total}")
-    lines.append(f"📡 Source: {np.source_label}")
+    lines.append(f"\n{bar}")
+    lines.append(f"⏱ {elapsed} / {total}   📡 {np.source_label}")
 
     if np.requested_by_name:
-        lines.append(f"👤 Requested by: {escape_html(np.requested_by_name)}")
+        lines.append(f"🙋 Requested by: {escape_html(np.requested_by_name)}")
 
-    lines.append(f"\n🔊 Volume: {state.volume}%")
-    lines.append(f"🔁 Loop: {loop_label}")
-    lines.append(f"🔀 Shuffle: {'ON' if state.shuffle_enabled else 'OFF'}")
+    lines.append("")
+    lines.append(
+        f"🔊 {state.volume}%   "
+        f"🔁 {loop_label}   "
+        f"🔀 {'ON' if state.shuffle_enabled else 'OFF'}"
+    )
     lines.append(f"📜 Queue: {q_len} song{'s' if q_len != 1 else ''}")
+    lines.append("◈──────────────────────────────◈")
 
     return "\n".join(lines)
+
+
+def _progress_bar(elapsed: int, duration: int, length: int = 14) -> str:
+    """Render a simple glass-style progress bar using block characters."""
+    if not duration:
+        return "▱" * length
+    ratio = max(0.0, min(1.0, elapsed / duration))
+    filled = int(round(ratio * length))
+    return "▰" * filled + "▱" * (length - filled)
 
 
 # ── Panel keyboard builder ─────────────────────────────────────────
@@ -98,22 +116,24 @@ def _build_panel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     is_playing = state.is_playing and not state.is_paused
     is_paused = state.is_paused
 
-    row1 = []
+    row1 = [InlineKeyboardButton("⏮ Prev", callback_data="pl:prev")]
     if is_playing:
         row1.append(InlineKeyboardButton("⏸ Pause", callback_data="pl:pause"))
     else:
         row1.append(InlineKeyboardButton("▶️ Play", callback_data="pl:resume"))
-    row1.append(InlineKeyboardButton("⏭ Skip", callback_data="pl:skip"))
+    row1.append(InlineKeyboardButton("⏭ Next", callback_data="pl:skip"))
     row1.append(InlineKeyboardButton("⏹ Stop", callback_data="pl:stop"))
 
     row2 = [
         InlineKeyboardButton("📜 Queue", callback_data="pl:queue"),
         InlineKeyboardButton("🎧 Info", callback_data="pl:info"),
+        InlineKeyboardButton("📤 Upload", callback_data="pl:upload"),
     ]
 
     row3 = [
         InlineKeyboardButton("🔁 Loop", callback_data="pl:loop"),
         InlineKeyboardButton("🔀 Shuffle", callback_data="pl:shuffle"),
+        InlineKeyboardButton("🤖 AI", callback_data="pl:ai"),
     ]
 
     row4 = [
@@ -341,6 +361,46 @@ def register_panel_handlers(bot: Client, calls):
             from handlers.player import skip_track
             msg = callback.message
             await skip_track(client, msg, calls, chat_id)
+            return
+
+        # ── Previous ───────────────────────────────────────────
+
+        if action == "prev":
+            await callback.answer()
+            if not can_control_playback(user_id, chat_id):
+                await callback.answer("⛔️ No permission", show_alert=True)
+                return
+            from handlers.player import play_previous
+            msg = callback.message
+            await play_previous(client, msg, calls, chat_id)
+            return
+
+        # ── Upload hint ──────────────────────────────────────────
+
+        if action == "upload":
+            await callback.answer(
+                "📤 Just send an audio file (MP3/M4A/WAV/OGG/FLAC) "
+                "here in the group — it'll be queued automatically.",
+                show_alert=True,
+            )
+            return
+
+        # ── AI suggestion hint ───────────────────────────────────
+
+        if action == "ai":
+            await callback.answer()
+            from services.ai_service import is_available
+            if not is_available():
+                await callback.answer(
+                    "🤖 AI features aren't configured for this bot yet.",
+                    show_alert=True,
+                )
+                return
+            await callback.answer(
+                "🤖 Type: /aiplay <how you feel or what you want to hear>\n"
+                "Example: /aiplay something relaxing for studying",
+                show_alert=True,
+            )
             return
 
         # ── Stop ───────────────────────────────────────────────

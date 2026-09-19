@@ -69,6 +69,9 @@ class NowPlaying:
 # ── Player State ────────────────────────────────────────────────────
 
 
+MAX_HISTORY = 20
+
+
 @dataclass
 class PlayerState:
     """Per-chat player state.  Each group gets one of these."""
@@ -80,6 +83,7 @@ class PlayerState:
     shuffle_enabled: bool = False
     volume: int = 100
     player_message_id: int = 0
+    history: list = field(default_factory=list)
 
     def reset(self):
         """Reset to idle state without changing chat_id."""
@@ -87,6 +91,21 @@ class PlayerState:
         self.is_paused = False
         self.now_playing = None
         self.player_message_id = 0
+        self.history.clear()
+
+    def push_history(self, np: Optional["NowPlaying"]):
+        """Record a track that just finished/was skipped, for the ⏮ Previous button."""
+        if np is None:
+            return
+        self.history.append(np)
+        if len(self.history) > MAX_HISTORY:
+            self.history.pop(0)
+
+    def pop_history(self) -> Optional["NowPlaying"]:
+        """Pop the most recently played track off the history stack."""
+        if not self.history:
+            return None
+        return self.history.pop()
 
 
 # ── State Registry ──────────────────────────────────────────────────

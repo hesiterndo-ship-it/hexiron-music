@@ -276,6 +276,81 @@ def register_admin_handlers(bot: Client, calls):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
+    # ── /aiplay command (AI-assisted natural language search) ────────
+
+    @bot.on_message(filters.command("aiplay"))
+    async def aiplay_cmd(client: Client, message: Message):
+        register_user_from_message(message)
+
+        from services import ai_service
+        if not ai_service.is_available():
+            await message.reply_text(
+                "🤖 AI features aren't configured for this bot.\n"
+                "An admin needs to set AI_PROVIDER / AI_API_KEY / AI_BASE_URL."
+            )
+            return
+
+        from utils.license_client import is_group_licensed
+        from config import CENTRAL_BOT_USERNAME
+        if message.chat.type.name in ("GROUP", "SUPERGROUP") and not await is_group_licensed(message.chat.id):
+            buy_hint = f"@{CENTRAL_BOT_USERNAME}" if CENTRAL_BOT_USERNAME else "the sales bot"
+            await message.reply_text(
+                "🚫 This group doesn't have an active music license.\n"
+                f"To purchase/renew: DM {buy_hint} and use /shop"
+            )
+            return
+
+        if len(message.command) < 2:
+            await message.reply_text(
+                "Usage: /aiplay <describe how you feel or what you want to hear>\n"
+                "Example: /aiplay something relaxing for studying"
+            )
+            return
+
+        user_message = message.text.split(None, 1)[1].strip()
+        status = await message.reply_text("🤖 Thinking of something for you...")
+
+        query = await ai_service.suggest_music(user_message)
+        if not query:
+            await status.edit_text(
+                "❌ Couldn't come up with a suggestion. Try /search <query> instead."
+            )
+            return
+
+        from music.downloader import search_results
+        try:
+            results = await asyncio.to_thread(search_results, query)
+        except Exception as e:
+            await status.edit_text(f"❌ Search error: {e}")
+            return
+
+        if not results:
+            await status.edit_text(f"❌ No results found for: {query}")
+            return
+
+        buttons = []
+        for i, r in enumerate(results[:5]):
+            title = r.get("title", "Unknown")
+            buttons.append([
+                InlineKeyboardButton(
+                    f"▶️ {title[:30]}",
+                    callback_data=f"pl:sresult:{i}",
+                ),
+            ])
+
+        from handlers.search import store_search_results
+        store_search_results(message.chat.id, message.from_user.id, results)
+
+        await status.edit_text(
+            f"🤖 <b>AI suggestion for:</b> {escape_html(user_message)}\n"
+            f"🔎 <b>Search:</b> {escape_html(query)}\n\n"
+            + "\n".join(
+                f"{i+1}. 🎵 {escape_html(r.get('title', 'Unknown'))}"
+                for i, r in enumerate(results[:5])
+            ),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
     # ── /broadcast command ───────────────────────────────────────────
 
     @bot.on_message(filters.command("broadcast"))
