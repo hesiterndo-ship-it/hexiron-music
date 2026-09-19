@@ -1,6 +1,6 @@
 kurigram==2.2.24
 tgcrypto==1.2.5
-py-tgcalls==2.3.3
+py-tgcalls==3.0.0rc3
 yt-dlp>=2024.1.1
 requests>=2.31.0
 python-dotenv>=1.0.1
