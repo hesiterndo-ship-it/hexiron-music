@@ -162,14 +162,20 @@ def init_db():
                 """
             )
 
-        # Refresh columns after migration.
         groups_columns = get_columns("groups")
 
         if "added_at" not in groups_columns:
             conn.execute(
                 """
                 ALTER TABLE groups
-                ADD COLUMN added_at TEXT NOT NULL DEFAULT (datetime('now'))
+                ADD COLUMN added_at TEXT
+                """
+            )
+            conn.execute(
+                """
+                UPDATE groups
+                SET added_at = datetime('now')
+                WHERE added_at IS NULL
                 """
             )
 
@@ -179,7 +185,14 @@ def init_db():
             conn.execute(
                 """
                 ALTER TABLE groups
-                ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                ADD COLUMN updated_at TEXT
+                """
+            )
+            conn.execute(
+                """
+                UPDATE groups
+                SET updated_at = datetime('now')
+                WHERE updated_at IS NULL
                 """
             )
 
@@ -966,3 +979,6 @@ def set_stat(
         )
 
         conn.commit()
+
+
+
