@@ -1,4 +1,5 @@
-﻿"""
+﻿
+"""
 SQLite database layer for HexIron Music Bot.
 
 Tables:
@@ -18,14 +19,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config import DATABASE_URL
 
+
 _lock = threading.Lock()
 
 
 @contextmanager
 def get_conn():
     """Thread-safe short-lived SQLite connection."""
-    conn = sqlite3.connect(DATABASE_URL, check_same_thread=False)
+    conn = sqlite3.connect(
+        DATABASE_URL,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
+
     try:
         yield conn
     finally:
@@ -33,22 +39,45 @@ def get_conn():
 
 
 def init_db():
-    """Create / migrate tables. Called once at startup."""
+    """
+    Create tables and safely migrate databases created by older versions.
+
+    IMPORTANT:
+    This function never deletes the existing database.
+    Existing data in /data is preserved.
+    """
+
     db_dir = os.path.dirname(DATABASE_URL)
+
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
 
     with _lock, get_conn() as conn:
+
+        # ------------------------------------------------------------
+        # Base database configuration
+        # ------------------------------------------------------------
+
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        # WAL is useful for a Telegram bot because multiple short-lived
+        # connections can access the database safely.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
+
+        # ------------------------------------------------------------
+        # Create current schema if tables do not exist
+        # ------------------------------------------------------------
+
         conn.executescript(
             """
-            PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
-
             CREATE TABLE IF NOT EXISTS groups (
-                chat_id   INTEGER PRIMARY KEY,
-                title     TEXT NOT NULL DEFAULT '',
-                is_active INTEGER NOT NULL DEFAULT 1,
-                added_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                chat_id    INTEGER PRIMARY KEY,
+                title      TEXT NOT NULL DEFAULT '',
+                is_active  INTEGER NOT NULL DEFAULT 1,
+                added_at   TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -61,27 +90,27 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS queue (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id     INTEGER NOT NULL,
-                title       TEXT NOT NULL DEFAULT '',
-                artist      TEXT NOT NULL DEFAULT '',
-                duration    INTEGER NOT NULL DEFAULT 0,
-                file_path   TEXT NOT NULL DEFAULT '',
-                source      TEXT NOT NULL DEFAULT 'search',
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id      INTEGER NOT NULL,
+                title        TEXT NOT NULL DEFAULT '',
+                artist       TEXT NOT NULL DEFAULT '',
+                duration     INTEGER NOT NULL DEFAULT 0,
+                file_path    TEXT NOT NULL DEFAULT '',
+                source       TEXT NOT NULL DEFAULT 'search',
                 requested_by INTEGER NOT NULL DEFAULT 0,
-                added_at    TEXT NOT NULL DEFAULT (datetime('now')),
-                sort_order  INTEGER NOT NULL DEFAULT 0
+                added_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                sort_order   INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS favorites (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id  INTEGER NOT NULL,
-                title    TEXT NOT NULL DEFAULT '',
-                artist   TEXT NOT NULL DEFAULT '',
-                duration INTEGER NOT NULL DEFAULT 0,
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER NOT NULL,
+                title     TEXT NOT NULL DEFAULT '',
+                artist    TEXT NOT NULL DEFAULT '',
+                duration  INTEGER NOT NULL DEFAULT 0,
                 file_path TEXT NOT NULL DEFAULT '',
-                source   TEXT NOT NULL DEFAULT 'search',
-                added_at TEXT NOT NULL DEFAULT (datetime('now')),
+                source    TEXT NOT NULL DEFAULT 'search',
+                added_at  TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(user_id, title, artist)
             );
 
@@ -99,48 +128,99 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS statistics (
-                id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                metric TEXT NOT NULL,
-                value  INTEGER NOT NULL DEFAULT 0,
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                metric  TEXT NOT NULL,
+                value   INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(metric)
             );
             """
         )
 
         # ------------------------------------------------------------
-        # Database migrations
+        # Migration helper
         # ------------------------------------------------------------
 
-        queue_columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(queue)").fetchall()
-        }
+        def get_columns(table_name: str) -> set:
+            return {
+                row["name"]
+                for row in conn.execute(
+                    f"PRAGMA table_info({table_name})"
+                ).fetchall()
+            }
 
-        # Older databases may have a queue table without sort_order.
-        if "sort_order" not in queue_columns:
+        # ------------------------------------------------------------
+        # GROUPS MIGRATIONS
+        # ------------------------------------------------------------
+
+        groups_columns = get_columns("groups")
+
+        if "is_active" not in groups_columns:
             conn.execute(
-                "ALTER TABLE queue "
-                "ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+                """
+                ALTER TABLE groups
+                ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1
+                """
             )
 
-        # Migrate existing databases created by older versions.
-        # Older queue tables may not have the sort_order column.
-        queue_columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(queue)").fetchall()
-        }
+        # Refresh columns after migration.
+        groups_columns = get_columns("groups")
+
+        if "added_at" not in groups_columns:
+            conn.execute(
+                """
+                ALTER TABLE groups
+                ADD COLUMN added_at TEXT NOT NULL DEFAULT (datetime('now'))
+                """
+            )
+
+        groups_columns = get_columns("groups")
+
+        if "updated_at" not in groups_columns:
+            conn.execute(
+                """
+                ALTER TABLE groups
+                ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                """
+            )
+
+        # ------------------------------------------------------------
+        # QUEUE MIGRATIONS
+        # ------------------------------------------------------------
+
+        queue_columns = get_columns("queue")
 
         if "sort_order" not in queue_columns:
             conn.execute(
-                "ALTER TABLE queue "
-                "ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+                """
+                ALTER TABLE queue
+                ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0
+                """
             )
 
-        # Create the index only after sort_order is guaranteed to exist.
+        # Older queue records may all have sort_order=0.
+        # Give them a stable order based on their original ID.
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_queue_chat "
-            "ON queue(chat_id, sort_order)"
+            """
+            UPDATE queue
+            SET sort_order = id
+            WHERE sort_order = 0
+            """
         )
+
+        # ------------------------------------------------------------
+        # INDEXES
+        # ------------------------------------------------------------
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_queue_chat
+            ON queue(chat_id, sort_order)
+            """
+        )
+
+        # ------------------------------------------------------------
+        # Finalize migration
+        # ------------------------------------------------------------
 
         conn.commit()
 
@@ -151,8 +231,22 @@ def init_db():
 def register_group(chat_id: int, title: str):
     with _lock, get_conn() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO groups(chat_id, title, is_active, added_at, updated_at) "
-            "VALUES (?, ?, 1, datetime('now'), datetime('now'))",
+            """
+            INSERT OR REPLACE INTO groups(
+                chat_id,
+                title,
+                is_active,
+                added_at,
+                updated_at
+            )
+            VALUES (
+                ?,
+                ?,
+                1,
+                datetime('now'),
+                datetime('now')
+            )
+            """,
             (chat_id, title),
         )
 
@@ -161,63 +255,124 @@ def register_group(chat_id: int, title: str):
 
 def remove_group(chat_id: int):
     with _lock, get_conn() as conn:
-        conn.execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
-        conn.execute("DELETE FROM queue WHERE chat_id=?", (chat_id,))
-        conn.execute("DELETE FROM chat_settings WHERE chat_id=?", (chat_id,))
+        conn.execute(
+            "DELETE FROM groups WHERE chat_id=?",
+            (chat_id,),
+        )
+
+        conn.execute(
+            "DELETE FROM queue WHERE chat_id=?",
+            (chat_id,),
+        )
+
+        conn.execute(
+            "DELETE FROM chat_settings WHERE chat_id=?",
+            (chat_id,),
+        )
+
         conn.commit()
 
 
 def list_groups() -> List[Tuple]:
     with _lock, get_conn() as conn:
         return conn.execute(
-            "SELECT chat_id, title FROM groups WHERE is_active=1 ORDER BY added_at"
+            """
+            SELECT chat_id, title
+            FROM groups
+            WHERE is_active=1
+            ORDER BY added_at
+            """
         ).fetchall()
 
 
 def group_count() -> int:
     with _lock, get_conn() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM groups WHERE is_active=1"
+            """
+            SELECT COUNT(*)
+            FROM groups
+            WHERE is_active=1
+            """
         ).fetchone()
+
         return row[0] if row else 0
 
 
 # ── users ────────────────────────────────────────────────────────────
 
 
-def register_user(user_id: int, username: str = "", full_name: str = ""):
+def register_user(
+    user_id: int,
+    username: str = "",
+    full_name: str = "",
+):
     with _lock, get_conn() as conn:
         conn.execute(
-            "INSERT INTO users(user_id, username, full_name, first_seen, last_seen) "
-            "VALUES (?, ?, ?, datetime('now'), datetime('now')) "
-            "ON CONFLICT(user_id) DO UPDATE SET "
-            "username=excluded.username, full_name=excluded.full_name, "
-            "last_seen=datetime('now')",
-            (user_id, username, full_name),
+            """
+            INSERT INTO users(
+                user_id,
+                username,
+                full_name,
+                first_seen,
+                last_seen
+            )
+            VALUES (
+                ?,
+                ?,
+                ?,
+                datetime('now'),
+                datetime('now')
+            )
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name,
+                last_seen=datetime('now')
+            """,
+            (
+                user_id,
+                username,
+                full_name,
+            ),
         )
+
         conn.commit()
 
 
 def get_user(user_id: int) -> Optional[Dict]:
     with _lock, get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM users WHERE user_id=?", (user_id,)
+            """
+            SELECT *
+            FROM users
+            WHERE user_id=?
+            """,
+            (user_id,),
         ).fetchone()
+
         return dict(row) if row else None
 
 
 def user_count() -> int:
     with _lock, get_conn() as conn:
-        row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()
+
         return row[0] if row else 0
 
 
 def top_users(limit: int = 10) -> List[Dict]:
     with _lock, get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM users ORDER BY last_seen DESC LIMIT ?",
+            """
+            SELECT *
+            FROM users
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
             (limit,),
         ).fetchall()
+
         return [dict(r) for r in rows]
 
 
@@ -234,18 +389,43 @@ def add_to_queue(
     source: str = "search",
 ) -> int:
     """Add a track to the queue. Returns the queue item id."""
+
     with _lock, get_conn() as conn:
+
         max_order = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), 0) "
-            "FROM queue WHERE chat_id=?",
+            """
+            SELECT COALESCE(MAX(sort_order), 0)
+            FROM queue
+            WHERE chat_id=?
+            """,
             (chat_id,),
         ).fetchone()[0]
 
         cur = conn.execute(
-            "INSERT INTO queue("
-            "chat_id, title, artist, duration, file_path, source, "
-            "requested_by, added_at, sort_order"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)",
+            """
+            INSERT INTO queue(
+                chat_id,
+                title,
+                artist,
+                duration,
+                file_path,
+                source,
+                requested_by,
+                added_at,
+                sort_order
+            )
+            VALUES (
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                datetime('now'),
+                ?
+            )
+            """,
             (
                 chat_id,
                 title,
@@ -257,71 +437,132 @@ def add_to_queue(
                 max_order + 1,
             ),
         )
+
         conn.commit()
+
         return cur.lastrowid
 
 
 def pop_next(chat_id: int) -> Optional[Dict]:
     """Remove and return the next queued track, or None."""
+
     with _lock, get_conn() as conn:
+
         row = conn.execute(
-            "SELECT id, title, artist, duration, file_path, source, requested_by "
-            "FROM queue WHERE chat_id=? "
-            "ORDER BY sort_order ASC LIMIT 1",
+            """
+            SELECT
+                id,
+                title,
+                artist,
+                duration,
+                file_path,
+                source,
+                requested_by
+            FROM queue
+            WHERE chat_id=?
+            ORDER BY sort_order ASC
+            LIMIT 1
+            """,
             (chat_id,),
         ).fetchone()
 
         if row is None:
             return None
 
-        conn.execute("DELETE FROM queue WHERE id=?", (row["id"],))
+        conn.execute(
+            "DELETE FROM queue WHERE id=?",
+            (row["id"],),
+        )
+
         conn.commit()
+
         return dict(row)
 
 
 def peek_queue(chat_id: int) -> List[Dict]:
     with _lock, get_conn() as conn:
+
         rows = conn.execute(
-            "SELECT id, title, artist, duration, file_path, source, "
-            "requested_by, added_at "
-            "FROM queue WHERE chat_id=? ORDER BY sort_order ASC",
+            """
+            SELECT
+                id,
+                title,
+                artist,
+                duration,
+                file_path,
+                source,
+                requested_by,
+                added_at
+            FROM queue
+            WHERE chat_id=?
+            ORDER BY sort_order ASC
+            """,
             (chat_id,),
         ).fetchall()
+
         return [dict(r) for r in rows]
 
 
 def queue_length(chat_id: int) -> int:
     with _lock, get_conn() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM queue WHERE chat_id=?",
+            """
+            SELECT COUNT(*)
+            FROM queue
+            WHERE chat_id=?
+            """,
             (chat_id,),
         ).fetchone()
+
         return row[0] if row else 0
 
 
 def clear_queue(chat_id: int):
     with _lock, get_conn() as conn:
-        conn.execute("DELETE FROM queue WHERE chat_id=?", (chat_id,))
-        conn.commit()
-
-
-def remove_queue_item(chat_id: int, item_id: int) -> bool:
-    with _lock, get_conn() as conn:
-        cur = conn.execute(
-            "DELETE FROM queue WHERE id=? AND chat_id=?",
-            (item_id, chat_id),
+        conn.execute(
+            "DELETE FROM queue WHERE chat_id=?",
+            (chat_id,),
         )
+
         conn.commit()
+
+
+def remove_queue_item(
+    chat_id: int,
+    item_id: int,
+) -> bool:
+    with _lock, get_conn() as conn:
+
+        cur = conn.execute(
+            """
+            DELETE FROM queue
+            WHERE id=? AND chat_id=?
+            """,
+            (
+                item_id,
+                chat_id,
+            ),
+        )
+
+        conn.commit()
+
         return cur.rowcount > 0
 
 
 def shuffle_queue(chat_id: int):
     """Randomize sort_order for a chat's queue."""
+
     import random
 
     with _lock, get_conn() as conn:
+
         rows = conn.execute(
-            "SELECT id FROM queue WHERE chat_id=? ORDER BY sort_order ASC",
+            """
+            SELECT id
+            FROM queue
+            WHERE chat_id=?
+            ORDER BY sort_order ASC
+            """,
             (chat_id,),
         ).fetchall()
 
@@ -329,12 +570,20 @@ def shuffle_queue(chat_id: int):
             return
 
         ids = [r["id"] for r in rows]
+
         random.shuffle(ids)
 
         for idx, qid in enumerate(ids):
             conn.execute(
-                "UPDATE queue SET sort_order=? WHERE id=?",
-                (idx, qid),
+                """
+                UPDATE queue
+                SET sort_order=?
+                WHERE id=?
+                """,
+                (
+                    idx,
+                    qid,
+                ),
             )
 
         conn.commit()
@@ -346,9 +595,16 @@ def move_queue_item(
     new_position: int,
 ) -> bool:
     """Move a queue item to a new position."""
+
     with _lock, get_conn() as conn:
+
         rows = conn.execute(
-            "SELECT id FROM queue WHERE chat_id=? ORDER BY sort_order ASC",
+            """
+            SELECT id
+            FROM queue
+            WHERE chat_id=?
+            ORDER BY sort_order ASC
+            """,
             (chat_id,),
         ).fetchall()
 
@@ -357,28 +613,50 @@ def move_queue_item(
         if item_id not in ids:
             return False
 
-        new_pos = max(0, min(new_position, len(ids) - 1))
+        new_pos = max(
+            0,
+            min(
+                new_position,
+                len(ids) - 1,
+            ),
+        )
 
         ids.remove(item_id)
         ids.insert(new_pos, item_id)
 
         for idx, qid in enumerate(ids):
             conn.execute(
-                "UPDATE queue SET sort_order=? WHERE id=?",
-                (idx, qid),
+                """
+                UPDATE queue
+                SET sort_order=?
+                WHERE id=?
+                """,
+                (
+                    idx,
+                    qid,
+                ),
             )
 
         conn.commit()
+
         return True
 
 
-def remove_stale_queue_items(max_age_hours: int = 24):
+def remove_stale_queue_items(
+    max_age_hours: int = 24,
+):
     """Remove queue items older than max_age_hours."""
+
     with _lock, get_conn() as conn:
+
         conn.execute(
-            "DELETE FROM queue WHERE added_at < datetime('now', ?)",
+            """
+            DELETE FROM queue
+            WHERE added_at < datetime('now', ?)
+            """,
             (f"-{max_age_hours} hours",),
         )
+
         conn.commit()
 
 
@@ -393,12 +671,31 @@ def add_favorite(
     file_path: str = "",
     source: str = "search",
 ) -> bool:
+
     with _lock, get_conn() as conn:
+
         try:
             conn.execute(
-                "INSERT INTO favorites("
-                "user_id, title, artist, duration, file_path, source, added_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+                """
+                INSERT INTO favorites(
+                    user_id,
+                    title,
+                    artist,
+                    duration,
+                    file_path,
+                    source,
+                    added_at
+                )
+                VALUES (
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    ?,
+                    datetime('now')
+                )
+                """,
                 (
                     user_id,
                     title,
@@ -408,8 +705,11 @@ def add_favorite(
                     source,
                 ),
             )
+
             conn.commit()
+
             return True
+
         except sqlite3.IntegrityError:
             return False
 
@@ -419,13 +719,23 @@ def remove_favorite(
     title: str,
     artist: str = "",
 ) -> bool:
+
     with _lock, get_conn() as conn:
+
         cur = conn.execute(
-            "DELETE FROM favorites "
-            "WHERE user_id=? AND title=? AND artist=?",
-            (user_id, title, artist),
+            """
+            DELETE FROM favorites
+            WHERE user_id=? AND title=? AND artist=?
+            """,
+            (
+                user_id,
+                title,
+                artist,
+            ),
         )
+
         conn.commit()
+
         return cur.rowcount > 0
 
 
@@ -434,21 +744,39 @@ def get_favorites(
     limit: int = 50,
     offset: int = 0,
 ) -> List[Dict]:
+
     with _lock, get_conn() as conn:
+
         rows = conn.execute(
-            "SELECT * FROM favorites "
-            "WHERE user_id=? ORDER BY added_at DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
+            """
+            SELECT *
+            FROM favorites
+            WHERE user_id=?
+            ORDER BY added_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (
+                user_id,
+                limit,
+                offset,
+            ),
         ).fetchall()
+
         return [dict(r) for r in rows]
 
 
 def favorite_count(user_id: int) -> int:
     with _lock, get_conn() as conn:
+
         row = conn.execute(
-            "SELECT COUNT(*) FROM favorites WHERE user_id=?",
+            """
+            SELECT COUNT(*)
+            FROM favorites
+            WHERE user_id=?
+            """,
             (user_id,),
         ).fetchone()
+
         return row[0] if row else 0
 
 
@@ -457,12 +785,22 @@ def is_favorite(
     title: str,
     artist: str = "",
 ) -> bool:
+
     with _lock, get_conn() as conn:
+
         row = conn.execute(
-            "SELECT 1 FROM favorites "
-            "WHERE user_id=? AND title=? AND artist=?",
-            (user_id, title, artist),
+            """
+            SELECT 1
+            FROM favorites
+            WHERE user_id=? AND title=? AND artist=?
+            """,
+            (
+                user_id,
+                title,
+                artist,
+            ),
         ).fetchone()
+
         return row is not None
 
 
@@ -483,8 +821,13 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
 
 def get_chat_settings(chat_id: int) -> Dict:
     with _lock, get_conn() as conn:
+
         row = conn.execute(
-            "SELECT * FROM chat_settings WHERE chat_id=?",
+            """
+            SELECT *
+            FROM chat_settings
+            WHERE chat_id=?
+            """,
             (chat_id,),
         ).fetchone()
 
@@ -492,12 +835,19 @@ def get_chat_settings(chat_id: int) -> Dict:
             return dict(row)
 
         conn.execute(
-            "INSERT INTO chat_settings(chat_id) VALUES (?)",
+            """
+            INSERT INTO chat_settings(chat_id)
+            VALUES (?)
+            """,
             (chat_id,),
         )
+
         conn.commit()
 
-        return dict(_DEFAULT_SETTINGS, chat_id=chat_id)
+        return dict(
+            _DEFAULT_SETTINGS,
+            chat_id=chat_id,
+        )
 
 
 def update_chat_setting(
@@ -511,56 +861,108 @@ def update_chat_setting(
         return False
 
     with _lock, get_conn() as conn:
+
         conn.execute(
-            f"UPDATE chat_settings SET {key}=?, "
-            "updated_at=datetime('now') WHERE chat_id=?",
-            (value, chat_id),
+            f"""
+            UPDATE chat_settings
+            SET {key}=?,
+                updated_at=datetime('now')
+            WHERE chat_id=?
+            """,
+            (
+                value,
+                chat_id,
+            ),
         )
 
         conn.execute(
-            "INSERT OR IGNORE INTO chat_settings(chat_id) VALUES (?)",
+            """
+            INSERT OR IGNORE INTO chat_settings(chat_id)
+            VALUES (?)
+            """,
             (chat_id,),
         )
 
         conn.commit()
+
         return True
 
 
 # ── statistics ───────────────────────────────────────────────────────
 
 
-def incr_stat(metric: str, amount: int = 1):
+def incr_stat(
+    metric: str,
+    amount: int = 1,
+):
     with _lock, get_conn() as conn:
+
         conn.execute(
-            "INSERT INTO statistics(metric, value) VALUES (?, ?) "
-            "ON CONFLICT(metric) DO UPDATE SET value=value+?",
-            (metric, amount, amount),
+            """
+            INSERT INTO statistics(metric, value)
+            VALUES (?, ?)
+            ON CONFLICT(metric)
+            DO UPDATE SET value=value+?
+            """,
+            (
+                metric,
+                amount,
+                amount,
+            ),
         )
+
         conn.commit()
 
 
 def get_stat(metric: str) -> int:
     with _lock, get_conn() as conn:
+
         row = conn.execute(
-            "SELECT value FROM statistics WHERE metric=?",
+            """
+            SELECT value
+            FROM statistics
+            WHERE metric=?
+            """,
             (metric,),
         ).fetchone()
+
         return row[0] if row else 0
 
 
 def get_all_stats() -> Dict[str, int]:
     with _lock, get_conn() as conn:
+
         rows = conn.execute(
-            "SELECT metric, value FROM statistics"
+            """
+            SELECT metric, value
+            FROM statistics
+            """
         ).fetchall()
-        return {r["metric"]: r["value"] for r in rows}
+
+        return {
+            r["metric"]: r["value"]
+            for r in rows
+        }
 
 
-def set_stat(metric: str, value: int):
+def set_stat(
+    metric: str,
+    value: int,
+):
     with _lock, get_conn() as conn:
+
         conn.execute(
-            "INSERT INTO statistics(metric, value) VALUES (?, ?) "
-            "ON CONFLICT(metric) DO UPDATE SET value=?",
-            (metric, value, value),
+            """
+            INSERT INTO statistics(metric, value)
+            VALUES (?, ?)
+            ON CONFLICT(metric)
+            DO UPDATE SET value=?
+            """,
+            (
+                metric,
+                value,
+                value,
+            ),
         )
+
         conn.commit()

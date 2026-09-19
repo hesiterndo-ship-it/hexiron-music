@@ -352,7 +352,7 @@ async def run():
     bot.add_handler(
         MessageHandler(
             partial(handle_audio_upload, calls=calls),
-            (filters.audio | filters.document) & filters.chat_type.groups,
+            (filters.audio | filters.document) & filters.group,
         )
     )
 
